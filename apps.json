@@ -1,0 +1,51 @@
+{
+  "store": "LStore",
+  "tagline": "The Luci OS App Store",
+  "publisher": "Vincent Ilagan",
+  "updated": "2026-07-01",
+  "base": "https://raw.githubusercontent.com/vincentilagan/LStore/main",
+  "apps": [
+    {
+      "id": "nodebase",
+      "name": "Nodebase",
+      "file": "nodebase.vx",
+      "version": "1.0",
+      "author": "Vincent Ilagan",
+      "category": "Development",
+      "icon": "🧩",
+      "featured": true,
+      "summary": "Node-based visual builder for Luci apps and flows.",
+      "description": "Design apps and automations by connecting nodes on a canvas — no code required. Built for Luci OS.",
+      "install": "apps/nodebase.vx",
+      "signed": false
+    },
+    {
+      "id": "pixel",
+      "name": "Pixel",
+      "file": "pixel.vx",
+      "version": "1.0",
+      "author": "Vincent Ilagan",
+      "category": "Graphics",
+      "icon": "🖼️",
+      "featured": true,
+      "summary": "Fast image viewer and light editor.",
+      "description": "Open, preview, crop and tweak images natively in Luci OS.",
+      "install": "apps/pixel.vx",
+      "signed": true
+    },
+    {
+      "id": "notes",
+      "name": "Notes",
+      "file": "notes.vx",
+      "version": "1.0",
+      "author": "Vincent Ilagan",
+      "category": "Productivity",
+      "icon": "📝",
+      "featured": false,
+      "summary": "A clean notepad and code scratchpad.",
+      "description": "Write notes, edit text and code with a distraction-free editor.",
+      "install": "apps/notes.vx",
+      "signed": true
+    }
+  ]
+}

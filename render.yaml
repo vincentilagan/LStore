@@ -1,0 +1,12 @@
+# Render.com Blueprint — deploys LStore as a static website.
+# In the Render dashboard: New + → Blueprint → pick the vincentilagan/LStore repo.
+# (Or: New + → Static Site → Publish directory: .)
+services:
+  - type: web
+    name: lstore
+    runtime: static
+    staticPublishPath: .
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html

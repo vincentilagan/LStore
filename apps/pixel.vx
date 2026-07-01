@@ -1,0 +1,889 @@
+﻿# VX:name=Pixel
+# VX:icon=🖼
+# VX:version=1.0
+# VX:author=Lucy
+# VX:sig=U7/y9I/EpLOatttXw4JaqgwGNZgZobdTbA5BOOtl6KJIBmtgLdHmX8zMXDbi48F8pbeShuESSxUsbZD1Hm5gDg==
+
+"""
+Pixel — VinX Photo Viewer & Editor
+High-tech dark viewer with full non-destructive editing suite.
+Requires: Pillow  (pip install Pillow)
+"""
+
+import tkinter as tk
+from tkinter import filedialog
+import os, sys, math, threading
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from luci import C, FONT, FONT_BOLD, FONT_SM, _user, _save_user, lucy_log
+
+try:
+    from PIL import Image, ImageTk, ImageEnhance, ImageFilter, ImageOps
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
+
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.ico', '.ppm', '.pgm'}
+
+# ── Colour constants for Pixel (always dark, independent of Lucy theme) ────────
+PX = {
+    "bg":       "#040810",
+    "panel":    "#080f1c",
+    "bar":      "#060c18",
+    "border":   "#142040",
+    "accent":   "#2060d0",
+    "accent2":  "#4488ff",
+    "text":     "#c8deff",
+    "dim":      "#3a5070",
+    "green":    "#2dcc66",
+    "red":      "#ff4444",
+    "yellow":   "#ffbb33",
+    "slider_t": "#0a1428",
+}
+
+
+class PixelApp:
+    def __init__(self, desktop, initial_path=None):
+        self.desktop = desktop
+
+        self.win = tk.Toplevel(desktop.root)
+        self.win.overrideredirect(True)
+        self.win.configure(bg="#142040")
+
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        w  = min(1280, sw - 60)
+        h  = min(820,  sh - 60)
+        self.win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+        self.win.attributes("-topmost", False)
+
+        # ── State ──────────────────────────────────────────────────────────
+        self._path          = None
+        self._orig          = None   # PIL Image — master copy for resets
+        self._base          = None   # PIL Image — after transforms (rotate/flip/crop)
+        self._img           = None   # PIL Image — current display (base + adj)
+        self._tk_img        = None   # ImageTk ref (must keep alive)
+        self._zoom          = 1.0
+        self._pan_x         = 0.0
+        self._pan_y         = 0.0
+        self._drag_start    = None
+        self._mode          = "viewer"
+        self._undo          = []
+        self._redo          = []
+        self._adj = dict(brightness=1.0, contrast=1.0,
+                         saturation=1.0, sharpness=1.0, exposure=1.0)
+        self._filter_key    = None
+        self._crop_mode     = False
+        self._crop_start    = None
+        self._crop_box      = None
+        self._folder_imgs   = []
+        self._folder_idx    = 0
+        self._sliders       = {}
+        self._filter_btns   = {}
+        self._maximized     = False
+
+        self._build()
+        if initial_path:
+            self.win.after(50, lambda: self._load(initial_path))
+        else:
+            self.win.after(100, self._open_dialog)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # UI BUILD
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build(self):
+        self._build_titlebar()
+        self._build_toolbar()
+        self._body = tk.Frame(self.win, bg=PX["bg"])
+        self._body.pack(fill="both", expand=True)
+        self._build_canvas()
+        self._build_editor_panel()
+        self._build_statusbar()
+
+    # ── Title bar ─────────────────────────────────────────────────────────────
+    def _build_titlebar(self):
+        bar = tk.Frame(self.win, bg=PX["bar"], height=36)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        self._bar = bar
+
+        tk.Label(bar, text="  🖼  Pixel", bg=PX["bar"], fg=PX["accent2"],
+                 font=("Segoe UI", 11, "bold")).pack(side="left", fill="y")
+
+        self._name_lbl = tk.Label(bar, text="  — no image", bg=PX["bar"],
+                                   fg=PX["dim"], font=FONT_SM)
+        self._name_lbl.pack(side="left", fill="y")
+
+        for txt, cmd, hover in [
+            ("✕",  self.win.destroy,       PX["red"]),
+            ("⛶",  self._toggle_maximize,  PX["border"]),
+        ]:
+            tk.Button(bar, text=txt, bg=PX["bar"], fg=PX["dim"],
+                      activebackground=hover, activeforeground="#fff",
+                      font=("Segoe UI", 10, "bold"), relief="flat", bd=0, padx=12,
+                      command=cmd).pack(side="right", fill="y")
+
+        # Mode tabs
+        sep = tk.Frame(bar, bg=PX["border"], width=1)
+        sep.pack(side="right", fill="y", pady=6, padx=4)
+
+        self._tab_editor = tk.Button(bar, text="  Editor  ", bg=PX["bar"], fg=PX["dim"],
+                                      font=FONT_SM, relief="flat", bd=0,
+                                      command=lambda: self._set_mode("editor"))
+        self._tab_editor.pack(side="right", fill="y")
+
+        self._tab_viewer = tk.Button(bar, text="  Viewer  ", bg=PX["accent"], fg="white",
+                                      font=FONT_SM, relief="flat", bd=0,
+                                      command=lambda: self._set_mode("viewer"))
+        self._tab_viewer.pack(side="right", fill="y")
+
+        sep2 = tk.Frame(bar, bg=PX["border"], width=1)
+        sep2.pack(side="right", fill="y", pady=6, padx=4)
+
+        # Wallpaper button
+        tk.Button(bar, text="🖥 Set Wallpaper", bg=PX["bar"], fg=PX["accent2"],
+                  font=FONT_SM, relief="flat", bd=0, padx=10,
+                  activebackground=PX["border"],
+                  command=self._set_wallpaper).pack(side="right", fill="y")
+
+        # Nav
+        self._nav_r = tk.Button(bar, text="›", bg=PX["bar"], fg=PX["text"],
+                                  font=("Segoe UI", 16, "bold"), relief="flat", bd=0, padx=8,
+                                  command=self._next)
+        self._nav_r.pack(side="right", fill="y")
+        self._nav_l = tk.Button(bar, text="‹", bg=PX["bar"], fg=PX["text"],
+                                  font=("Segoe UI", 16, "bold"), relief="flat", bd=0, padx=8,
+                                  command=self._prev)
+        self._nav_l.pack(side="right", fill="y")
+
+        drag = [None]
+        bar.bind("<ButtonPress-1>",   lambda e: drag.__setitem__(0,(e.x_root-self.win.winfo_x(), e.y_root-self.win.winfo_y())))
+        bar.bind("<B1-Motion>",       lambda e: self.win.geometry(f"+{e.x_root-drag[0][0]}+{e.y_root-drag[0][1]}") if drag[0] else None)
+        bar.bind("<ButtonRelease-1>", lambda e: drag.__setitem__(0, None))
+
+    # ── Toolbar ───────────────────────────────────────────────────────────────
+    def _build_toolbar(self):
+        self._tbar = tk.Frame(self.win, bg=PX["panel"], height=34)
+        self._tbar.pack(fill="x")
+        self._tbar.pack_propagate(False)
+        self._refresh_toolbar()
+
+    def _refresh_toolbar(self):
+        for w in self._tbar.winfo_children():
+            w.destroy()
+
+        def _btn(text, cmd, fg=None, bg=None):
+            b = tk.Button(self._tbar, text=text,
+                          bg=bg or PX["panel"], fg=fg or PX["text"],
+                          font=FONT_SM, relief="flat", bd=0, padx=10, pady=6,
+                          activebackground=PX["border"], activeforeground="#fff",
+                          command=cmd)
+            b.pack(side="left")
+            return b
+
+        def _sep():
+            tk.Frame(self._tbar, bg=PX["border"], width=1).pack(side="left", fill="y", pady=6, padx=3)
+
+        _btn("📂 Open", self._open_dialog)
+        _sep()
+
+        if self._mode == "editor":
+            _btn("↩ Undo", self._do_undo)
+            _btn("↪ Redo", self._do_redo)
+            _sep()
+            _btn("↻ CW",     lambda: self._transform("cw"))
+            _btn("↺ CCW",    lambda: self._transform("ccw"))
+            _btn("↔ Flip H", lambda: self._transform("flipH"))
+            _btn("↕ Flip V", lambda: self._transform("flipV"))
+            _sep()
+            _btn("✂ Crop",   self._enter_crop, fg=PX["yellow"])
+            _sep()
+            _btn("⟳ Reset",  self._reset, fg=PX["red"])
+            _sep()
+            _btn("💾 Save",   self._save, bg=PX["accent"], fg="#fff")
+            _btn("Save As",  self._save_as)
+        else:
+            _btn("↻ CW",     lambda: self._transform("cw"))
+            _btn("↺ CCW",    lambda: self._transform("ccw"))
+            _sep()
+            _btn("📋 Info",  self._show_info)
+
+    # ── Main canvas ───────────────────────────────────────────────────────────
+    def _build_canvas(self):
+        cf = tk.Frame(self._body, bg="#020508")
+        cf.pack(side="left", fill="both", expand=True)
+
+        self._canv = tk.Canvas(cf, bg="#020508", highlightthickness=0)
+        self._canv.pack(fill="both", expand=True)
+
+        self._canv.bind("<ButtonPress-1>",   self._press)
+        self._canv.bind("<B1-Motion>",       self._drag)
+        self._canv.bind("<ButtonRelease-1>", self._release)
+        self._canv.bind("<Double-Button-1>", self._dbl)
+        self._canv.bind("<MouseWheel>",      self._wheel)
+        self._canv.bind("<Configure>",       lambda e: self._redraw())
+        self.win.bind("<Left>",              lambda e: self._prev())
+        self.win.bind("<Right>",             lambda e: self._next())
+        self.win.bind("<plus>",              lambda e: self._zoom_by(1.2))
+        self.win.bind("<minus>",             lambda e: self._zoom_by(1/1.2))
+        self.win.bind("<f>",                 lambda e: self._zoom_fit())
+        self.win.bind("<Control-z>",         lambda e: self._do_undo())
+        self.win.bind("<Control-y>",         lambda e: self._do_redo())
+        self.win.bind("<Control-s>",         lambda e: self._save())
+
+    # ── Editor panel ──────────────────────────────────────────────────────────
+    def _build_editor_panel(self):
+        self._ep = tk.Frame(self._body, bg=PX["panel"], width=270)
+        # packed only in editor mode
+
+        # Scrollable inner
+        sb = tk.Scrollbar(self._ep, bg=PX["border"], troughcolor=PX["panel"],
+                          width=8, relief="flat")
+        sb.pack(side="right", fill="y")
+
+        inner_c = tk.Canvas(self._ep, bg=PX["panel"], highlightthickness=0,
+                             yscrollcommand=sb.set)
+        inner_c.pack(fill="both", expand=True)
+        sb.config(command=inner_c.yview)
+
+        inner = tk.Frame(inner_c, bg=PX["panel"])
+        iwin  = inner_c.create_window(0, 0, window=inner, anchor="nw", width=260)
+        inner.bind("<Configure>", lambda e: inner_c.config(scrollregion=inner_c.bbox("all")))
+        inner_c.bind("<Configure>", lambda e: inner_c.itemconfig(iwin, width=e.width))
+
+        def _sec(title, icon=""):
+            tk.Label(inner, text=f"  {icon}  {title}" if icon else f"  {title}",
+                     bg=PX["bar"], fg=PX["accent2"],
+                     font=("Segoe UI", 8, "bold"), anchor="w", pady=5
+                     ).pack(fill="x", pady=(10, 0))
+
+        def _slider(label, key, lo=0.0, hi=2.0, default=1.0):
+            row = tk.Frame(inner, bg=PX["panel"])
+            row.pack(fill="x", padx=10, pady=2)
+            tk.Label(row, text=label, bg=PX["panel"], fg=PX["dim"],
+                     font=FONT_SM, width=11, anchor="w").pack(side="left")
+            var = tk.DoubleVar(value=default)
+            sc = tk.Scale(row, variable=var, from_=lo, to=hi, resolution=0.01,
+                          orient="horizontal", length=120,
+                          bg=PX["panel"], fg=PX["text"], troughcolor=PX["slider_t"],
+                          activebackground=PX["accent2"],
+                          highlightthickness=0, bd=0, showvalue=False)
+            sc.pack(side="left")
+            lbl = tk.Label(row, text=f"{default:.2f}", bg=PX["panel"],
+                           fg=PX["accent2"], font=("Consolas", 8), width=5)
+            lbl.pack(side="left")
+            # Reset on double-click
+            sc.bind("<Double-Button-1>", lambda e, v=default, k=key: (var.set(v), None))
+
+            def _upd(*_):
+                v = round(var.get(), 3)
+                self._adj[key] = v
+                lbl.config(text=f"{v:.2f}")
+                self._apply_adj()
+            var.trace_add("write", _upd)
+            self._sliders[key] = var
+
+        # ── Adjustments ───────────────────────────────────────────────────────
+        _sec("Adjustments", "✦")
+        _slider("Brightness", "brightness")
+        _slider("Contrast",   "contrast")
+        _slider("Saturation", "saturation")
+        _slider("Sharpness",  "sharpness")
+        _slider("Exposure",   "exposure",  lo=0.1, hi=3.0)
+        tk.Label(inner, text="  Double-click slider to reset",
+                 bg=PX["panel"], fg=PX["dim"], font=("Segoe UI", 7),
+                 anchor="w").pack(fill="x", padx=10)
+
+        # ── Filters ───────────────────────────────────────────────────────────
+        _sec("Filters", "◈")
+        fg_frame = tk.Frame(inner, bg=PX["panel"])
+        fg_frame.pack(fill="x", padx=10, pady=4)
+        filters = [
+            ("None",       None),     ("Vivid",      "vivid"),
+            ("Grayscale",  "gray"),   ("Sepia",      "sepia"),
+            ("Cool",       "cool"),   ("Warm",       "warm"),
+            ("Invert",     "invert"), ("Blur",       "blur"),
+            ("Sharpen",    "sharpen"),("Detail",     "detail"),
+            ("Emboss",     "emboss"), ("Edge",       "edge"),
+            ("Smooth",     "smooth"), ("Glow",       "glow"),
+        ]
+        for i, (name, key) in enumerate(filters):
+            _k = key
+            btn = tk.Button(fg_frame, text=name,
+                            bg=PX["accent"] if key is None else PX["border"],
+                            fg="white" if key is None else PX["text"],
+                            font=("Segoe UI", 8), relief="flat", bd=0,
+                            padx=4, pady=5,
+                            command=lambda k=_k: self._set_filter(k))
+            btn.grid(row=i//2, column=i%2, padx=2, pady=1, sticky="ew")
+            self._filter_btns[key] = btn
+        fg_frame.columnconfigure(0, weight=1)
+        fg_frame.columnconfigure(1, weight=1)
+
+        # ── Transform ─────────────────────────────────────────────────────────
+        _sec("Transform", "⟳")
+        tf = tk.Frame(inner, bg=PX["panel"])
+        tf.pack(fill="x", padx=10, pady=4)
+        for i, (name, key) in enumerate([
+            ("↻ Rotate CW",  "cw"),  ("↺ Rotate CCW", "ccw"),
+            ("↔ Flip H",     "flipH"),("↕ Flip V",    "flipV"),
+        ]):
+            _k = key
+            tk.Button(tf, text=name, bg=PX["border"], fg=PX["text"],
+                      font=FONT_SM, relief="flat", bd=0, padx=6, pady=6,
+                      activebackground=PX["accent"], activeforeground="#fff",
+                      command=lambda k=_k: self._transform(k)
+                      ).grid(row=i//2, column=i%2, padx=2, pady=2, sticky="ew")
+        tf.columnconfigure(0, weight=1)
+        tf.columnconfigure(1, weight=1)
+
+        # ── Crop ──────────────────────────────────────────────────────────────
+        _sec("Crop", "✂")
+        tk.Button(inner, text="✂  Enter Crop Mode",
+                  bg=PX["accent"], fg="white",
+                  font=FONT_SM, relief="flat", bd=0, padx=8, pady=6,
+                  command=self._enter_crop).pack(fill="x", padx=10, pady=4)
+
+        # ── Resize ────────────────────────────────────────────────────────────
+        _sec("Resize", "⊞")
+        rf = tk.Frame(inner, bg=PX["panel"])
+        rf.pack(fill="x", padx=10, pady=4)
+        tk.Label(rf, text="W:", bg=PX["panel"], fg=PX["dim"], font=FONT_SM).grid(row=0,column=0,pady=3)
+        self._rw = tk.Entry(rf, bg=PX["border"], fg=PX["text"], font=FONT_SM,
+                            relief="flat", bd=3, width=6, insertbackground="#fff")
+        self._rw.grid(row=0, column=1, padx=2)
+        tk.Label(rf, text="H:", bg=PX["panel"], fg=PX["dim"], font=FONT_SM).grid(row=0,column=2,pady=3)
+        self._rh = tk.Entry(rf, bg=PX["border"], fg=PX["text"], font=FONT_SM,
+                            relief="flat", bd=3, width=6, insertbackground="#fff")
+        self._rh.grid(row=0, column=3, padx=2)
+        tk.Button(rf, text="Apply Resize", bg=PX["accent"], fg="white",
+                  font=FONT_SM, relief="flat", bd=0, padx=8, pady=5,
+                  command=self._apply_resize).grid(row=1, column=0, columnspan=4,
+                                                    sticky="ew", pady=4)
+        rf.columnconfigure(1, weight=1); rf.columnconfigure(3, weight=1)
+
+        # ── Export ────────────────────────────────────────────────────────────
+        _sec("Export", "💾")
+        ef = tk.Frame(inner, bg=PX["panel"])
+        ef.pack(fill="x", padx=10, pady=4)
+        tk.Button(ef, text="💾 Save", bg=PX["accent"], fg="white",
+                  font=FONT_BOLD, relief="flat", bd=0, padx=10, pady=7,
+                  command=self._save).pack(side="left", fill="x", expand=True, padx=(0,2))
+        tk.Button(ef, text="Save As…", bg=PX["border"], fg=PX["text"],
+                  font=FONT_SM, relief="flat", bd=0, padx=10, pady=7,
+                  command=self._save_as).pack(side="left", fill="x", expand=True, padx=(2,0))
+
+        tk.Button(inner, text="⟳ Reset All Edits",
+                  bg=PX["panel"], fg=PX["red"],
+                  font=FONT_SM, relief="flat", bd=0, pady=8,
+                  command=self._reset).pack(fill="x", padx=10, pady=(4,12))
+
+    # ── Status bar ────────────────────────────────────────────────────────────
+    def _build_statusbar(self):
+        sb = tk.Frame(self.win, bg=PX["bar"], height=24)
+        sb.pack(fill="x")
+        sb.pack_propagate(False)
+
+        self._st_left  = tk.Label(sb, text="  No image", bg=PX["bar"],
+                                   fg=PX["dim"], font=("Consolas", 8))
+        self._st_left.pack(side="left", fill="y", padx=6)
+
+        self._zoom_lbl = tk.Label(sb, text="—", bg=PX["bar"],
+                                   fg=PX["accent2"], font=("Consolas", 8, "bold"))
+        self._zoom_lbl.pack(side="right", padx=8, fill="y")
+
+        zf = tk.Frame(sb, bg=PX["bar"])
+        zf.pack(side="right", fill="y")
+        for txt, cmd in [("−", lambda: self._zoom_by(0.8)),
+                         ("Fit", self._zoom_fit),
+                         ("1:1", self._zoom_100),
+                         ("+", lambda: self._zoom_by(1.25))]:
+            tk.Button(zf, text=txt, bg=PX["border"], fg=PX["text"],
+                      font=("Consolas", 8), relief="flat", bd=0,
+                      padx=6, pady=2, command=cmd
+                      ).pack(side="left", padx=1, pady=2)
+
+        self._st_right = tk.Label(sb, text="", bg=PX["bar"],
+                                   fg=PX["dim"], font=("Consolas", 8))
+        self._st_right.pack(side="right", padx=10, fill="y")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # IMAGE LOAD
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _open_dialog(self):
+        path = filedialog.askopenfilename(
+            parent=self.win, title="Open Image",
+            filetypes=[("Images","*.jpg *.jpeg *.png *.gif *.bmp *.webp *.tiff *.ico"),
+                       ("All","*.*")])
+        if path:
+            self._load(path)
+
+    def _load(self, path):
+        try:
+            img = Image.open(path)
+            if img.mode not in ("RGB","RGBA","L"):
+                img = img.convert("RGB")
+            if img.mode == "L":
+                img = img.convert("RGB")
+            self._orig = img.copy()
+            self._base = img.copy()
+            self._img  = img.copy()
+            self._path = path
+            self._undo.clear(); self._redo.clear()
+            self._reset_adj_values()
+            self._filter_key = None
+            self._zoom = 1.0; self._pan_x = 0.0; self._pan_y = 0.0
+
+            # Folder
+            folder = os.path.dirname(path)
+            try:
+                self._folder_imgs = sorted([
+                    os.path.join(folder, f) for f in os.listdir(folder)
+                    if os.path.splitext(f)[1].lower() in IMAGE_EXTS
+                ])
+                self._folder_idx = self._folder_imgs.index(path)
+            except Exception:
+                self._folder_imgs = [path]; self._folder_idx = 0
+
+            name = os.path.basename(path)
+            w, h = img.size
+            fsize = os.path.getsize(path)
+            sstr  = f"{fsize/1024:.0f} KB" if fsize < 1048576 else f"{fsize/1048576:.1f} MB"
+            fmt   = img.format or path.split(".")[-1].upper()
+
+            self._name_lbl.config(text=f"  — {name}")
+            self._st_right.config(text=f"{w} × {h}   {sstr}   {fmt}")
+            self._st_left.config(text=f"  {self._folder_idx+1}/{len(self._folder_imgs)}")
+
+            if hasattr(self, "_rw"):
+                self._rw.delete(0,"end"); self._rw.insert(0,str(w))
+                self._rh.delete(0,"end"); self._rh.insert(0,str(h))
+
+            lucy_log("LAUNCH", f"Pixel opened: {name}")
+            self.win.after(30, self._zoom_fit)
+        except Exception as ex:
+            self._st_left.config(text=f"  Error: {ex}")
+
+    def _prev(self):
+        if len(self._folder_imgs) > 1:
+            self._folder_idx = (self._folder_idx - 1) % len(self._folder_imgs)
+            self._load(self._folder_imgs[self._folder_idx])
+
+    def _next(self):
+        if len(self._folder_imgs) > 1:
+            self._folder_idx = (self._folder_idx + 1) % len(self._folder_imgs)
+            self._load(self._folder_imgs[self._folder_idx])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # DISPLAY
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _redraw(self):
+        self._canv.delete("all")
+        if self._img is None:
+            cw = max(1, self._canv.winfo_width())
+            ch = max(1, self._canv.winfo_height())
+            self._canv.create_text(cw//2, ch//2, text="🖼\nOpen an image",
+                                    fill=PX["dim"], font=("Segoe UI Emoji",22), justify="center")
+            return
+
+        cw = max(1, self._canv.winfo_width())
+        ch = max(1, self._canv.winfo_height())
+        iw, ih = self._img.size
+
+        dw = max(1, int(iw * self._zoom))
+        dh = max(1, int(ih * self._zoom))
+        ox = cw//2 - dw//2 + int(self._pan_x)
+        oy = ch//2 - dh//2 + int(self._pan_y)
+
+        # Checkerboard for transparent images
+        if self._img.mode == "RGBA":
+            cb = Image.new("RGB", (dw, dh), "#1a1a2e")
+            self._canv.create_image(ox, oy, image=ImageTk.PhotoImage(cb), anchor="nw")
+
+        try:
+            disp = self._img.resize((dw, dh),
+                   Image.LANCZOS if self._zoom < 4 else Image.NEAREST)
+        except Exception:
+            disp = self._img
+
+        self._tk_img = ImageTk.PhotoImage(disp)
+        self._canv.create_image(ox, oy, image=self._tk_img, anchor="nw")
+
+        # Thin border around image
+        self._canv.create_rectangle(ox-1, oy-1, ox+dw, oy+dh,
+                                     outline=PX["border"], width=1)
+
+        self._zoom_lbl.config(text=f"{self._zoom*100:.0f}%")
+
+        if self._crop_mode:
+            self._st_left.config(text="  ✂ Crop mode — drag to select, double-click to apply, ESC to cancel")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ZOOM & PAN
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _zoom_by(self, f):
+        self._zoom = max(0.02, min(32.0, self._zoom * f))
+        self._redraw()
+
+    def _zoom_fit(self):
+        if self._img is None: return
+        cw = max(1, self._canv.winfo_width())
+        ch = max(1, self._canv.winfo_height())
+        iw, ih = self._img.size
+        self._zoom   = min(cw/iw, ch/ih) * 0.96
+        self._pan_x  = 0.0; self._pan_y = 0.0
+        self._redraw()
+
+    def _zoom_100(self):
+        self._zoom = 1.0; self._pan_x = 0.0; self._pan_y = 0.0
+        self._redraw()
+
+    def _wheel(self, e):
+        self._zoom_by(1.15 if e.delta > 0 else 1/1.15)
+
+    def _press(self, e):
+        if self._crop_mode:
+            self._crop_start = (e.x, e.y)
+            if self._crop_box:
+                self._canv.delete(self._crop_box)
+        else:
+            self._drag_start = (e.x, e.y, self._pan_x, self._pan_y)
+
+    def _drag(self, e):
+        if self._crop_mode and self._crop_start:
+            if self._crop_box:
+                self._canv.delete(self._crop_box)
+            x0,y0 = self._crop_start
+            self._crop_box = self._canv.create_rectangle(
+                x0,y0,e.x,e.y, outline=PX["accent2"], width=2, dash=(5,3))
+        elif self._drag_start:
+            dx = e.x - self._drag_start[0]
+            dy = e.y - self._drag_start[1]
+            self._pan_x = self._drag_start[2] + dx
+            self._pan_y = self._drag_start[3] + dy
+            self._redraw()
+
+    def _release(self, e):
+        self._drag_start = None
+
+    def _dbl(self, e):
+        if self._crop_mode and self._crop_start and self._crop_box:
+            self._do_crop(e.x, e.y)
+
+    def _toggle_maximize(self):
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        if not self._maximized:
+            self.win.geometry(f"{sw}x{sh-48}+0+0")
+            self._maximized = True
+        else:
+            w,h = 1280,820
+            self.win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+            self._maximized = False
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # EDITOR
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _set_mode(self, mode):
+        self._mode = mode
+        if mode == "editor":
+            self._ep.pack(side="right", fill="y", before=self._canv.master if hasattr(self._canv,"master") else None)
+            self._tab_viewer.config(bg=PX["bar"],    fg=PX["dim"])
+            self._tab_editor.config(bg=PX["accent"], fg="white")
+        else:
+            self._ep.pack_forget()
+            self._tab_viewer.config(bg=PX["accent"], fg="white")
+            self._tab_editor.config(bg=PX["bar"],    fg=PX["dim"])
+        self._refresh_toolbar()
+        self._redraw()
+
+    # ── Undo/Redo ─────────────────────────────────────────────────────────────
+    def _push_undo(self):
+        if self._base:
+            self._undo.append((self._base.copy(), dict(self._adj), self._filter_key))
+            if len(self._undo) > 30: self._undo.pop(0)
+            self._redo.clear()
+
+    def _do_undo(self):
+        if self._undo:
+            self._redo.append((self._base.copy(), dict(self._adj), self._filter_key))
+            self._base, adj, fk = self._undo.pop()
+            self._adj.update(adj)
+            self._filter_key = fk
+            self._sync_sliders()
+            self._apply_adj()
+
+    def _do_redo(self):
+        if self._redo:
+            self._undo.append((self._base.copy(), dict(self._adj), self._filter_key))
+            self._base, adj, fk = self._redo.pop()
+            self._adj.update(adj)
+            self._filter_key = fk
+            self._sync_sliders()
+            self._apply_adj()
+
+    # ── Adjustments ───────────────────────────────────────────────────────────
+    def _reset_adj_values(self):
+        for k in self._adj: self._adj[k] = 1.0
+        self._sync_sliders()
+
+    def _sync_sliders(self):
+        for k, var in self._sliders.items():
+            var.set(self._adj.get(k, 1.0))
+
+    def _apply_adj(self):
+        if self._base is None: return
+        img = self._base.convert("RGB")
+        if self._filter_key:
+            img = self._do_filter(img, self._filter_key)
+        br = self._adj["brightness"] * self._adj["exposure"]
+        img = ImageEnhance.Brightness(img).enhance(br)
+        img = ImageEnhance.Contrast(img).enhance(self._adj["contrast"])
+        img = ImageEnhance.Color(img).enhance(self._adj["saturation"])
+        img = ImageEnhance.Sharpness(img).enhance(self._adj["sharpness"])
+        self._img = img
+        self._redraw()
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    def _set_filter(self, key):
+        if self._base is None: return
+        self._push_undo()
+        self._filter_key = key
+        self._apply_adj()
+        for k, btn in self._filter_btns.items():
+            active = (k == key)
+            btn.config(bg=PX["accent"] if active else PX["border"],
+                       fg="white" if active else PX["text"])
+
+    def _do_filter(self, img, key):
+        if key is None: return img
+        if key == "gray":
+            return ImageOps.grayscale(img).convert("RGB")
+        if key == "sepia":
+            g = ImageOps.grayscale(img)
+            return Image.merge("RGB",[
+                g.point(lambda x: min(255,int(x*1.08))),
+                g.point(lambda x: min(255,int(x*0.85))),
+                g.point(lambda x: min(255,int(x*0.66))),
+            ])
+        if key == "invert":
+            return ImageOps.invert(img)
+        if key == "blur":
+            return img.filter(ImageFilter.GaussianBlur(radius=2))
+        if key == "sharpen":
+            return img.filter(ImageFilter.UnsharpMask(radius=2, percent=160, threshold=3))
+        if key == "detail":
+            return img.filter(ImageFilter.DETAIL)
+        if key == "emboss":
+            return img.filter(ImageFilter.EMBOSS)
+        if key == "edge":
+            return img.filter(ImageFilter.FIND_EDGES).convert("RGB")
+        if key == "smooth":
+            return img.filter(ImageFilter.SMOOTH_MORE)
+        if key == "vivid":
+            img = ImageEnhance.Color(img).enhance(1.9)
+            return ImageEnhance.Contrast(img).enhance(1.15)
+        if key == "cool":
+            r,g,b = img.split()
+            return Image.merge("RGB",(r.point(lambda x:int(x*0.88)),g,b.point(lambda x:min(255,int(x*1.22)))))
+        if key == "warm":
+            r,g,b = img.split()
+            return Image.merge("RGB",(r.point(lambda x:min(255,int(x*1.22))),g,b.point(lambda x:int(x*0.82))))
+        if key == "glow":
+            blurred = img.filter(ImageFilter.GaussianBlur(radius=8))
+            return Image.blend(img, blurred, 0.35)
+        return img
+
+    # ── Transform ─────────────────────────────────────────────────────────────
+    def _transform(self, action):
+        if self._base is None: return
+        self._push_undo()
+        img = self._base
+        if   action == "cw":    img = img.rotate(-90, expand=True)
+        elif action == "ccw":   img = img.rotate( 90, expand=True)
+        elif action == "flipH": img = ImageOps.mirror(img)
+        elif action == "flipV": img = ImageOps.flip(img)
+        self._base = img.copy()
+        self._orig = img.copy()
+        self._apply_adj()
+
+    # ── Crop ──────────────────────────────────────────────────────────────────
+    def _enter_crop(self):
+        self._crop_mode  = True
+        self._crop_start = None
+        self._crop_box   = None
+        self._canv.config(cursor="crosshair")
+        self.win.bind("<Escape>", lambda e: self._exit_crop())
+        self._st_left.config(text="  ✂  Crop: drag to select  •  double-click to apply  •  ESC to cancel")
+
+    def _exit_crop(self):
+        self._crop_mode = False
+        if self._crop_box: self._canv.delete(self._crop_box)
+        self._crop_box = self._crop_start = None
+        self._canv.config(cursor="")
+        self.win.unbind("<Escape>")
+        self._redraw()
+
+    def _do_crop(self, ex, ey):
+        if not self._crop_start or self._base is None: return
+        x0c,y0c = self._crop_start
+        x1c,y1c = ex, ey
+        if abs(x1c-x0c) < 5 or abs(y1c-y0c) < 5: return
+
+        cw = self._canv.winfo_width()
+        ch = self._canv.winfo_height()
+        iw,ih = self._base.size
+        dw = int(iw*self._zoom); dh = int(ih*self._zoom)
+        ox = cw//2 - dw//2 + int(self._pan_x)
+        oy = ch//2 - dh//2 + int(self._pan_y)
+
+        def _c2i(cx,cy):
+            return (int(max(0,min(iw,(cx-ox)/self._zoom))),
+                    int(max(0,min(ih,(cy-oy)/self._zoom))))
+
+        ax0,ay0 = _c2i(min(x0c,x1c),min(y0c,y1c))
+        ax1,ay1 = _c2i(max(x0c,x1c),max(y0c,y1c))
+        if ax1<=ax0 or ay1<=ay0: return
+
+        self._push_undo()
+        cropped = self._base.crop((ax0,ay0,ax1,ay1))
+        self._base = cropped.copy()
+        self._orig = cropped.copy()
+        self._exit_crop()
+        self.win.after(30, self._zoom_fit)
+
+    # ── Resize ────────────────────────────────────────────────────────────────
+    def _apply_resize(self):
+        if self._base is None: return
+        try:
+            w = int(self._rw.get()); h = int(self._rh.get())
+            if w<1 or h<1: return
+            self._push_undo()
+            self._base = self._base.resize((w,h), Image.LANCZOS)
+            self._orig = self._base.copy()
+            self._apply_adj()
+        except ValueError: pass
+
+    # ── Reset ─────────────────────────────────────────────────────────────────
+    def _reset(self):
+        if self._path:
+            img = Image.open(self._path)
+            if img.mode not in ("RGB","RGBA"): img = img.convert("RGB")
+            self._orig = img.copy(); self._base = img.copy()
+            self._reset_adj_values()
+            self._filter_key = None
+            self._undo.clear(); self._redo.clear()
+            for k,btn in self._filter_btns.items():
+                btn.config(bg=PX["accent"] if k is None else PX["border"],
+                           fg="white" if k is None else PX["text"])
+            self._apply_adj()
+
+    # ── Info ──────────────────────────────────────────────────────────────────
+    def _show_info(self):
+        if self._path is None: return
+        win = tk.Toplevel(self.win)
+        win.overrideredirect(True)
+        win.configure(bg=PX["border"])
+        win.attributes("-topmost", True)
+        w,h = 380,260
+        sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
+        win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+
+        bar = tk.Frame(win, bg=PX["bar"], height=28)
+        bar.pack(fill="x"); bar.pack_propagate(False)
+        tk.Label(bar, text="  📋  Image Info", bg=PX["bar"], fg=PX["accent2"],
+                 font=FONT_BOLD).pack(side="left",fill="y")
+        tk.Button(bar, text="✕", bg=PX["bar"], fg=PX["dim"],
+                  activebackground=PX["red"], font=FONT_BOLD, relief="flat", bd=0,
+                  padx=8, command=win.destroy).pack(side="right",fill="y")
+
+        body = tk.Frame(win, bg=PX["panel"])
+        body.pack(fill="both",expand=True,padx=1,pady=(0,1))
+
+        try:
+            img  = Image.open(self._path)
+            fsize = os.path.getsize(self._path)
+            rows = [
+                ("File",     os.path.basename(self._path)),
+                ("Path",     os.path.dirname(self._path)),
+                ("Size",     f"{fsize/1024:.1f} KB  ({fsize:,} bytes)"),
+                ("Format",   img.format or "?"),
+                ("Mode",     img.mode),
+                ("Dimensions",f"{img.size[0]} × {img.size[1]} px"),
+                ("Megapixels",f"{img.size[0]*img.size[1]/1e6:.1f} MP"),
+            ]
+            for label,val in rows:
+                r = tk.Frame(body, bg=PX["panel"])
+                r.pack(fill="x",padx=12,pady=3)
+                tk.Label(r,text=label,bg=PX["panel"],fg=PX["dim"],
+                         font=FONT_SM,width=12,anchor="w").pack(side="left")
+                tk.Label(r,text=str(val),bg=PX["panel"],fg=PX["text"],
+                         font=FONT_SM,anchor="w",wraplength=230).pack(side="left",fill="x",expand=True)
+        except Exception as ex:
+            tk.Label(body,text=str(ex),bg=PX["panel"],fg=PX["red"],font=FONT_SM).pack(pady=20)
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    def _save(self):
+        if self._img and self._path:
+            try:
+                out = self._img.convert("RGB") if self._path.lower().endswith((".jpg",".jpeg")) else self._img
+                out.save(self._path)
+                self._st_left.config(text=f"  ✓ Saved: {os.path.basename(self._path)}")
+                lucy_log("SYSTEM",f"Pixel saved: {os.path.basename(self._path)}")
+            except Exception as ex:
+                self._st_left.config(text=f"  ✗ {ex}")
+
+    def _save_as(self):
+        if self._img is None: return
+        path = filedialog.asksaveasfilename(
+            parent=self.win, defaultextension=".png",
+            filetypes=[("PNG","*.png"),("JPEG","*.jpg *.jpeg"),
+                       ("BMP","*.bmp"),("WebP","*.webp"),("All","*.*")])
+        if path:
+            try:
+                out = self._img.convert("RGB") if path.lower().endswith((".jpg",".jpeg")) else self._img
+                out.save(path)
+                self._path = path
+                self._name_lbl.config(text=f"  — {os.path.basename(path)}")
+                self._st_left.config(text=f"  ✓ Saved as: {os.path.basename(path)}")
+                lucy_log("SYSTEM",f"Pixel saved as: {os.path.basename(path)}")
+            except Exception as ex:
+                self._st_left.config(text=f"  ✗ {ex}")
+
+    # ── Wallpaper ─────────────────────────────────────────────────────────────
+    def _set_wallpaper(self):
+        if self._path is None: return
+        u = _user()
+        u["wallpaper"] = self._path
+        _save_user(u)
+        lucy_log("THEME", f"Wallpaper set: {os.path.basename(self._path)}")
+        try:
+            self.desktop._draw_pattern()
+            self._st_left.config(text="  ✓ Wallpaper set!  Lucy desktop updated.")
+        except Exception:
+            self._st_left.config(text="  ✓ Wallpaper saved — restart Lucy to apply.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Entry points
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main(desktop):
+    if not PIL_OK:
+        import tkinter.messagebox as mb
+        mb.showerror("Pixel", "Pillow not installed.\nOpen Gate and run:\n  pip install Pillow")
+        return
+    PixelApp(desktop)
+
+
+def open_image(desktop, path):
+    if not PIL_OK:
+        import tkinter.messagebox as mb
+        mb.showerror("Pixel", "Pillow not installed.\nOpen Gate and run:\n  pip install Pillow")
+        return
+    PixelApp(desktop, path)
