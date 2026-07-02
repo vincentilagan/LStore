@@ -6,6 +6,20 @@
   "base": "https://raw.githubusercontent.com/vincentilagan/LStore/main",
   "apps": [
     {
+      "id": "music",
+      "name": "Music",
+      "file": "music.vx",
+      "version": "3.0",
+      "author": "Vincent Ilagan",
+      "category": "Media",
+      "icon": "🎵",
+      "featured": true,
+      "summary": "Music player — playlists, library and album art.",
+      "description": "Play your music library on Luci OS with playlists and album art.",
+      "install": "apps/music.vx",
+      "signed": true
+    },
+    {
       "id": "nodebase",
       "name": "NodeBase",
       "file": "nodebase.vx",
@@ -45,6 +59,20 @@
       "summary": "Fast image viewer and light editor.",
       "description": "Open, preview, crop and tweak images natively in Luci OS.",
       "install": "apps/pixel.vx",
+      "signed": true
+    },
+    {
+      "id": "video",
+      "name": "Video",
+      "file": "video.vx",
+      "version": "3.0",
+      "author": "Vincent Ilagan",
+      "category": "Media",
+      "icon": "🎬",
+      "featured": true,
+      "summary": "Video player — plays every format via mpv.",
+      "description": "Watch videos on Luci OS with a clean player backed by mpv.",
+      "install": "apps/video.vx",
       "signed": true
     }
   ]

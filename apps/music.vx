@@ -1,0 +1,790 @@
+# VX:name=Music
+# VX:icon=🎵
+# VX:version=3.0
+# VX:sig=xs7RHC0EhY8INcr/bHUvwvAev/Yo7h0qVdLfC1tgguSn+c/6k/TPMAAaWoQTXzJOOlU/A5iuDmWK2U4b2M5DDQ==
+"""
+Luci Music — full glassy player.
+
+STANDARD window: subclass of _QtLucyWindow (the 🔴🟡🔵 hex chrome, drag,
+resize, minimise-to-dock, workspace tagging) — we only fill self.content.
+
+Layout (matches the Luci sample):
+  ┌ sidebar ┬──────── now playing ────────┬─ play queue ─┐
+  │ nav     │  [cover]   title / artist    │  track list  │
+  │ items   │            tags · lyric · viz│              │
+  │ + sound │  scrub + transport           │              │
+  └─────────┴── bottom: mini · wave · vol · eq · fullscreen┘
+
+Backend: mpv (audio-only, --no-video) driven over JSON-IPC; it owns the
+playlist so queue advance / shuffle / repeat are gapless and format-wide.
+Metadata + embedded cover art via mutagen (falls back to filename + a
+generated gradient cover when tags/art are missing).
+"""
+
+import os, sys, json, socket, time, math, hashlib, random
+from PyQt5.QtCore    import Qt, QTimer, QRectF, QPointF, QSize, pyqtSignal
+from PyQt5.QtGui     import (QFont, QColor, QPainter, QPen, QBrush,
+                              QPainterPath, QLinearGradient, QRadialGradient,
+                              QPixmap, QImage, QFontMetrics)
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                              QPushButton, QFileDialog, QApplication,
+                              QScrollArea, QFrame)
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from luci import _QtLucyWindow, C, _UI_FAM
+
+try:
+    import mutagen
+    from mutagen import File as _MutFile
+    _MUT = True
+except Exception:
+    _MUT = False
+
+ACC   = QColor(C.get("accent", "#4c8dff"))
+ACC2  = QColor(C.get("accent2", "#7aa9ff"))
+WHITE = QColor(232, 240, 255)
+DIM   = QColor(140, 160, 200)
+MUSIC_DIR = os.path.expanduser("~/Music")
+EXTS = (".mp3", ".flac", ".wav", ".m4a", ".ogg", ".opus", ".aac", ".wma")
+
+
+# ── helpers ───────────────────────────────────────────────────────────
+def _fmt(sec):
+    sec = int(max(0, sec or 0)); return f"{sec//60}:{sec%60:02d}"
+
+
+def _grad_cover(seed, size=240):
+    """A deterministic colourful gradient cover for tracks with no art."""
+    h = int(hashlib.md5(seed.encode("utf-8", "ignore")).hexdigest(), 16)
+    c1 = QColor.fromHsv(h % 360, 180, 230)
+    c2 = QColor.fromHsv((h // 360) % 360, 200, 150)
+    pm = QPixmap(size, size); pm.fill(Qt.transparent)
+    p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing)
+    g = QLinearGradient(0, 0, size, size)
+    g.setColorAt(0, c1); g.setColorAt(1, c2)
+    path = QPainterPath(); path.addRoundedRect(QRectF(0, 0, size, size), 14, 14)
+    p.fillPath(path, g)
+    # faint concentric rings
+    p.setPen(QPen(QColor(255, 255, 255, 30), 2))
+    for r in range(size//6, size, size//6):
+        p.drawEllipse(QPointF(size/2, size/2), r*0.6, r*0.6)
+    p.end()
+    return pm
+
+
+def _read_meta(path):
+    base = os.path.splitext(os.path.basename(path))[0]
+    meta = {"title": base, "artist": "Unknown Artist", "album": "",
+            "dur": 0.0, "cover": None}
+    # filename "Artist - Title"
+    if " - " in base:
+        a, t = base.split(" - ", 1)
+        meta["artist"], meta["title"] = a.strip(), t.strip()
+    if not _MUT:
+        return meta
+    try:
+        mf = _MutFile(path)
+        if mf is not None:
+            if mf.info and getattr(mf.info, "length", 0):
+                meta["dur"] = float(mf.info.length)
+            tags = mf.tags or {}
+            def g(*keys):
+                for k in keys:
+                    v = tags.get(k)
+                    if v: return str(v[0]) if isinstance(v, list) else str(v)
+                return None
+            meta["title"]  = g("TIT2", "title", "\xa9nam") or meta["title"]
+            meta["artist"] = g("TPE1", "artist", "\xa9ART") or meta["artist"]
+            meta["album"]  = g("TALB", "album", "\xa9alb") or ""
+            # embedded cover art
+            art = None
+            try:
+                if hasattr(mf, "pictures") and mf.pictures:
+                    art = mf.pictures[0].data
+                elif tags:
+                    for k in tags.keys():
+                        if k.startswith("APIC"):
+                            art = tags[k].data; break
+                    if art is None and "covr" in tags:
+                        art = bytes(tags["covr"][0])
+            except Exception:
+                art = None
+            if art:
+                img = QImage()
+                if img.loadFromData(art):
+                    meta["cover"] = QPixmap.fromImage(img)
+    except Exception:
+        pass
+    return meta
+
+
+# ── mpv audio backend ─────────────────────────────────────────────────
+class _Mpv:
+    SOCK = "/tmp/luci-music.sock"
+    def __init__(self):
+        self._proc = None; self._sock = None
+        self._avail = self._which("mpv") is not None
+    @staticmethod
+    def _which(n):
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            p = os.path.join(d, n)
+            if os.path.isfile(p) and os.access(p, os.X_OK): return p
+        for p in (f"/usr/local/bin/{n}", f"/usr/bin/{n}"):
+            if os.path.isfile(p): return p
+        return None
+    def available(self): return self._avail
+    def start(self):
+        if self._proc or not self._avail: return
+        import subprocess
+        try: os.unlink(self.SOCK)
+        except FileNotFoundError: pass
+        self._proc = subprocess.Popen(
+            [self._which("mpv"), "--no-video", "--idle=yes",
+             "--no-terminal", f"--input-ipc-server={self.SOCK}",
+             "--ao=oss", "--audio-device=oss//dev/dsp0", "--volume=78"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        for _ in range(40):
+            if os.path.exists(self.SOCK): break
+            time.sleep(0.05)
+    def stop(self):
+        # Quit mpv cleanly, then make SURE it dies (it runs in its own
+        # session, so kill the whole process group) — otherwise the audio
+        # keeps playing after the window closes.
+        try: self._cmd("quit")
+        except Exception: pass
+        try:
+            if self._proc and self._proc.poll() is None:
+                self._proc.terminate()
+                try: self._proc.wait(timeout=1)
+                except Exception:
+                    import signal
+                    try: os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+                    except Exception:
+                        try: self._proc.kill()
+                        except Exception: pass
+        except Exception: pass
+        self._proc = None
+        if self._sock:
+            try: self._sock.close()
+            except Exception: pass
+            self._sock = None
+    def _cmd(self, *args):
+        # Match responses by request_id and SKIP interleaved async events —
+        # a plain single recv() was returning event data, which corrupted
+        # seeks, song-switch and the time/duration readout.
+        if not self._proc: return None
+        try:
+            if self._sock is None:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(0.5); s.connect(self.SOCK); self._sock = s
+            self._rid = (getattr(self, "_rid", 0) % 1000000) + 1
+            rid = self._rid
+            self._sock.send((json.dumps(
+                {"command": list(args), "request_id": rid}) + "\n").encode())
+            buf = b""
+            t0 = time.time()
+            while time.time() - t0 < 0.6:
+                try: chunk = self._sock.recv(8192)
+                except socket.timeout: break
+                if not chunk: break
+                buf += chunk
+                parts = buf.split(b"\n"); buf = parts.pop()
+                for ln in parts:
+                    try: j = json.loads(ln.decode("utf-8", "ignore"))
+                    except Exception: continue
+                    if j.get("request_id") == rid:
+                        return j.get("data")
+            return None
+        except Exception:
+            try: self._sock.close()
+            except Exception: pass
+            self._sock = None
+            return None
+    def set_playlist(self, files, start=0):
+        if not files: return
+        self._cmd("loadfile", files[0], "replace")
+        for f in files[1:]:
+            self._cmd("loadfile", f, "append")
+        if start: self.play_index(start)
+    def play_index(self, i):  self._cmd("set_property", "playlist-pos", i); self._cmd("set_property","pause",False)
+    def toggle(self):         self._cmd("cycle", "pause")
+    def next(self):           self._cmd("playlist-next", "force")
+    def prev(self):           self._cmd("playlist-prev", "force")
+    def seek(self, sec):      self._cmd("seek", float(sec), "absolute")
+    def set_vol(self, v):     self._cmd("set_property", "volume", int(v))
+    def set_shuffle(self, on):self._cmd("set_property", "shuffle", bool(on))
+    def set_loop(self, mode): # 0 none, 1 all, 2 one
+        self._cmd("set_property", "loop-playlist", "inf" if mode==1 else "no")
+        self._cmd("set_property", "loop-file", "inf" if mode==2 else "no")
+    def pos(self):       return self._cmd("get_property", "time-pos")
+    def dur(self):       return self._cmd("get_property", "duration")
+    def paused(self):    return self._cmd("get_property", "pause")
+    def index(self):     return self._cmd("get_property", "playlist-pos")
+
+
+# ── small painted widgets ─────────────────────────────────────────────
+def _stroke(p, col, w=2.0):
+    pen = QPen(col); pen.setWidthF(w); pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin); p.setPen(pen); p.setBrush(Qt.NoBrush)
+
+
+def _glyph(p, name, cx, cy, s, col, w=2.0):
+    r = s/2.0; p.save(); _stroke(p, col, w)
+    if name == "play":
+        path = QPainterPath(); path.moveTo(cx-r*.4, cy-r*.7)
+        path.lineTo(cx+r*.75, cy); path.lineTo(cx-r*.4, cy+r*.7); path.closeSubpath()
+        p.setBrush(QBrush(col)); p.setPen(Qt.NoPen); p.drawPath(path)
+    elif name == "pause":
+        p.setBrush(QBrush(col)); p.setPen(Qt.NoPen)
+        p.drawRoundedRect(QRectF(cx-r*.5, cy-r*.7, r*.32, r*1.4), 2, 2)
+        p.drawRoundedRect(QRectF(cx+r*.18, cy-r*.7, r*.32, r*1.4), 2, 2)
+    elif name in ("prev", "next"):
+        sign = -1 if name=="prev" else 1
+        p.setBrush(QBrush(col)); p.setPen(Qt.NoPen)
+        p.drawRoundedRect(QRectF(cx+sign*r*.7-(r*.16 if sign>0 else 0), cy-r*.55, r*.16, r*1.1),1,1)
+        path = QPainterPath(); path.moveTo(cx+sign*r*.55, cy-r*.5)
+        path.lineTo(cx-sign*r*.45, cy); path.lineTo(cx+sign*r*.55, cy+r*.5); path.closeSubpath()
+        p.drawPath(path)
+    elif name == "shuffle":
+        for dy in (-r*.45, r*.45):
+            p.drawLine(QPointF(cx-r*.8, cy+dy*0.9), QPointF(cx-r*.2, cy+dy*0.9))
+            p.drawLine(QPointF(cx-r*.2, cy+dy*0.9), QPointF(cx+r*.6, cy-dy*0.9))
+        for ax in (1,):
+            p.drawLine(QPointF(cx+r*.35, cy-r*.75), QPointF(cx+r*.75, cy-r*.4))
+            p.drawLine(QPointF(cx+r*.35, cy+r*.05), QPointF(cx+r*.75, cy+r*.4))
+    elif name == "repeat":
+        p.drawArc(QRectF(cx-r*.7, cy-r*.7, r*1.4, r*1.4), 30*16, 300*16)
+        p.setBrush(QBrush(col)); p.setPen(Qt.NoPen)
+        path = QPainterPath(); path.moveTo(cx+r*.5, cy-r*.85)
+        path.lineTo(cx+r*.85, cy-r*.45); path.lineTo(cx+r*.35, cy-r*.4); path.closeSubpath()
+        p.drawPath(path)
+    elif name == "heart":
+        path = QPainterPath(); path.moveTo(cx, cy+r*.6)
+        path.cubicTo(cx-r*1.1, cy-r*.3, cx-r*.4, cy-r*.95, cx, cy-r*.35)
+        path.cubicTo(cx+r*.4, cy-r*.95, cx+r*1.1, cy-r*.3, cx, cy+r*.6)
+        p.drawPath(path)
+    elif name == "vol":
+        p.setBrush(QBrush(col)); p.setPen(Qt.NoPen)
+        sp = QPainterPath(); sp.moveTo(cx-r*.8, cy-r*.3); sp.lineTo(cx-r*.4, cy-r*.3)
+        sp.lineTo(cx+r*.05, cy-r*.7); sp.lineTo(cx+r*.05, cy+r*.7); sp.lineTo(cx-r*.4, cy+r*.3)
+        sp.lineTo(cx-r*.8, cy+r*.3); sp.closeSubpath(); p.drawPath(sp)
+        _stroke(p, col, w)
+        for k in (.35, .62): p.drawArc(QRectF(cx+r*.1-r*k, cy-r*k, r*k*2, r*k*2), -55*16, 110*16)
+    elif name == "eq":
+        for i, hh in enumerate((.5, .9, .65)):
+            x = cx + (i-1)*r*.55
+            p.drawLine(QPointF(x, cy-r*hh), QPointF(x, cy+r*hh))
+            p.setBrush(QBrush(col)); p.setPen(Qt.NoPen)
+            p.drawEllipse(QPointF(x, cy + (r*.3*(1 if i==1 else -1))), 2.4, 2.4)
+            _stroke(p, col, w)
+    elif name == "moon":
+        path = QPainterPath(); path.addEllipse(QPointF(cx, cy), r*.8, r*.8)
+        cut = QPainterPath(); cut.addEllipse(QPointF(cx+r*.4, cy-r*.3), r*.7, r*.7)
+        p.drawPath(path.subtracted(cut))
+    elif name == "expand":
+        for (sx, sy) in ((-1,-1),(1,-1),(-1,1),(1,1)):
+            x0, y0 = cx+sx*r*.7, cy+sy*r*.7
+            p.drawLine(QPointF(x0,y0), QPointF(x0-sx*r*.4, y0))
+            p.drawLine(QPointF(x0,y0), QPointF(x0, y0-sy*r*.4))
+    elif name == "search":
+        p.drawEllipse(QPointF(cx-r*.15, cy-r*.15), r*.5, r*.5)
+        p.drawLine(QPointF(cx+r*.25, cy+r*.25), QPointF(cx+r*.7, cy+r*.7))
+    elif name == "dots":
+        p.setBrush(QBrush(col)); p.setPen(Qt.NoPen)
+        for dx in (-r*.6, 0, r*.6): p.drawEllipse(QPointF(cx+dx, cy), 2.0, 2.0)
+    # nav icons
+    elif name == "discover":
+        p.drawEllipse(QPointF(cx, cy), r*.8, r*.8)
+        path = QPainterPath(); path.moveTo(cx+r*.35, cy-r*.35); path.lineTo(cx-r*.1, cy+r*.1)
+        path.lineTo(cx-r*.35, cy+r*.35); path.lineTo(cx+r*.1, cy-r*.1); path.closeSubpath()
+        p.setBrush(QBrush(col)); p.setPen(Qt.NoPen); p.drawPath(path)
+    elif name == "library":
+        p.drawLine(QPointF(cx+r*.3, cy-r*.7), QPointF(cx+r*.3, cy+r*.5))
+        p.setBrush(QBrush(col)); p.setPen(Qt.NoPen)
+        p.drawEllipse(QPointF(cx-r*.05, cy+r*.5), r*.32, r*.26)
+        _stroke(p, col, w); p.drawLine(QPointF(cx+r*.3, cy-r*.7), QPointF(cx+r*.7, cy-r*.55))
+    elif name == "radio":
+        p.drawArc(QRectF(cx-r*.8, cy-r*.8, r*1.6, r*1.6), 30*16, 120*16)
+        p.drawArc(QRectF(cx-r*.45, cy-r*.45, r*.9, r*.9), 30*16, 120*16)
+        p.setBrush(QBrush(col)); p.setPen(Qt.NoPen); p.drawEllipse(QPointF(cx, cy), 2.6, 2.6)
+    elif name == "nowplaying":
+        p.setBrush(QBrush(col)); p.setPen(Qt.NoPen)
+        for i, hh in enumerate((.5, .9, .35, .7)):
+            x = cx + (i-1.5)*r*.45
+            p.drawRoundedRect(QRectF(x-1.4, cy-r*hh, 2.8, r*hh*2), 1.2, 1.2)
+    elif name == "playlists":
+        p.setBrush(QBrush(col)); p.setPen(Qt.NoPen)
+        for dy in (-r*.5, 0, r*.5):
+            p.drawEllipse(QPointF(cx-r*.7, cy+dy), 1.8, 1.8)
+            p.drawRoundedRect(QRectF(cx-r*.4, cy+dy-1.4, r*1.2, 2.8), 1.2, 1.2)
+    p.restore()
+
+
+class _IconBtn(QPushButton):
+    def __init__(self, name, size=40, glyph_scale=0.5, primary=False, on=False):
+        super().__init__()
+        self._name=name; self._gs=glyph_scale; self._primary=primary
+        self._hover=False; self._on=on
+        self.setFixedSize(size, size); self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet("background:transparent;border:none;")
+    def set_on(self, v): self._on=v; self.update()
+    def set_name(self, n): self._name=n; self.update()
+    def enterEvent(self,e): self._hover=True; self.update()
+    def leaveEvent(self,e): self._hover=False; self.update()
+    def paintEvent(self,_e):
+        p=QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        w=self.width()
+        if self._primary:
+            rect=QRectF(2,2,w-4,w-4)
+            g=QRadialGradient(w/2,w/2,w/2)
+            g.setColorAt(0, QColor(ACC.red(),ACC.green(),ACC.blue(), 70 if self._hover else 45))
+            g.setColorAt(1, QColor(ACC.red(),ACC.green(),ACC.blue(), 0))
+            p.setBrush(g); p.setPen(Qt.NoPen); p.drawEllipse(rect)
+            pen=QPen(ACC); pen.setWidthF(2.2); p.setPen(pen); p.setBrush(Qt.NoBrush)
+            p.drawEllipse(rect)
+        col = QColor(ACC) if (self._on or self._hover) else QColor(200,214,238)
+        _glyph(p, self._name, w/2, w/2, w*self._gs, col, 2.2 if self._primary else 1.9)
+
+
+class _Viz(QWidget):
+    """Animated frequency bars (center now-playing visualiser)."""
+    def __init__(self, n=40, h=64):
+        super().__init__(); self._n=n; self.setFixedHeight(h)
+        self._vals=[random.random() for _ in range(n)]
+        self._tgt=list(self._vals); self._play=False
+        self._t=QTimer(self); self._t.timeout.connect(self._tick); self._t.start(50)
+    def set_playing(self,v): self._play=v
+    def _tick(self):
+        for i in range(self._n):
+            if self._play and random.random()<0.4:
+                self._tgt[i]=0.15+random.random()*0.85
+            elif not self._play:
+                self._tgt[i]*=0.9
+            self._vals[i]+=(self._tgt[i]-self._vals[i])*0.3
+        self.update()
+    def paintEvent(self,_e):
+        p=QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        w=self.width(); h=self.height(); bw=w/self._n
+        for i,v in enumerate(self._vals):
+            bh=max(2, v*h)
+            g=QLinearGradient(0,h,0,h-bh)
+            g.setColorAt(0, QColor(ACC.red(),ACC.green(),ACC.blue(),230))
+            g.setColorAt(1, QColor(ACC2.red(),ACC2.green(),ACC2.blue(),230))
+            p.fillRect(QRectF(i*bw+bw*0.18, h-bh, bw*0.64, bh), g)
+
+
+class _Wave(QWidget):
+    def __init__(self):
+        super().__init__(); self.setMinimumHeight(40); self._ph=0.0; self._play=False
+        self._t=QTimer(self); self._t.timeout.connect(self._tick); self._t.start(40)
+    def set_playing(self,v): self._play=v
+    def _tick(self):
+        if self._play: self._ph+=0.15; self.update()
+    def paintEvent(self,_e):
+        p=QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        w=self.width(); h=self.height(); cy=h/2
+        pen=QPen(QColor(ACC.red(),ACC.green(),ACC.blue(),200)); pen.setWidthF(1.6); p.setPen(pen)
+        path=QPainterPath(); path.moveTo(0,cy)
+        for x in range(0,w,3):
+            amp = (h*0.35) * (0.4+0.6*math.sin(x*0.01))
+            y = cy + math.sin(x*0.05 + self._ph)*amp*(1 if self._play else 0.25)
+            path.lineTo(x,y)
+        p.drawPath(path)
+
+
+class _Scrub(QWidget):
+    seek=pyqtSignal(float)
+    def __init__(self):
+        super().__init__(); self.setFixedHeight(20); self.setMouseTracking(True)
+        self._p=0.0; self._drag=False
+    def set_progress(self,x):
+        if not self._drag: self._p=max(0,min(1,x)); self.update()
+    def _f(self,x): return max(0,min(1,x/max(1,self.width())))
+    def mousePressEvent(self,e): self._drag=True; self._p=self._f(e.x()); self.update()
+    def mouseMoveEvent(self,e):
+        if self._drag: self._p=self._f(e.x()); self.update()
+    def mouseReleaseEvent(self,e):
+        if self._drag: self._drag=False; self.seek.emit(self._f(e.x()))
+    def paintEvent(self,_e):
+        p=QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        w=self.width(); cy=self.height()/2
+        pen=QPen(QColor(255,255,255,45)); pen.setWidthF(4); pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen); p.drawLine(QPointF(4,cy),QPointF(w-4,cy))
+        hx=4+(w-8)*self._p
+        pen=QPen(ACC); pen.setWidthF(4); pen.setCapStyle(Qt.RoundCap); p.setPen(pen)
+        p.drawLine(QPointF(4,cy),QPointF(hx,cy))
+        p.setPen(Qt.NoPen); p.setBrush(QColor(255,255,255)); p.drawEllipse(QPointF(hx,cy),6,6)
+
+
+class _VolSlider(QWidget):
+    changed=pyqtSignal(float)
+    def __init__(self,v=0.78):
+        super().__init__(); self.setFixedSize(120,22); self._v=v
+    def set_v(self,v): self._v=v; self.update()
+    def _set(self,x): self._v=max(0,min(1,x/max(1,self.width()))); self.update(); self.changed.emit(self._v)
+    def mousePressEvent(self,e): self._set(e.x())
+    def mouseMoveEvent(self,e):
+        if e.buttons()&Qt.LeftButton: self._set(e.x())
+    def paintEvent(self,_e):
+        p=QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        w=self.width(); cy=self.height()/2
+        pen=QPen(QColor(255,255,255,50)); pen.setWidthF(4); pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen); p.drawLine(QPointF(4,cy),QPointF(w-4,cy))
+        hx=4+(w-8)*self._v
+        pen=QPen(ACC); pen.setWidthF(4); pen.setCapStyle(Qt.RoundCap); p.setPen(pen)
+        p.drawLine(QPointF(4,cy),QPointF(hx,cy))
+        p.setPen(Qt.NoPen); p.setBrush(QColor(255,255,255)); p.drawEllipse(QPointF(hx,cy),6,6)
+
+
+class _NavItem(QPushButton):
+    def __init__(self, icon, label, active=False):
+        super().__init__(); self._icon=icon; self._label=label
+        self._active=active; self._hover=False
+        self.setFixedHeight(56); self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet("background:transparent;border:none;text-align:left;")
+    def set_active(self,v): self._active=v; self.update()
+    def enterEvent(self,e): self._hover=True; self.update()
+    def leaveEvent(self,e): self._hover=False; self.update()
+    def paintEvent(self,_e):
+        p=QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        w=self.width(); h=self.height()
+        if self._active:
+            path=QPainterPath(); path.addRoundedRect(QRectF(6,4,w-12,h-8),12,12)
+            g=QLinearGradient(0,0,w,0)
+            g.setColorAt(0, QColor(ACC.red(),ACC.green(),ACC.blue(),55))
+            g.setColorAt(1, QColor(ACC.red(),ACC.green(),ACC.blue(),12))
+            p.fillPath(path,g)
+            p.fillRect(QRectF(6,h*0.25,3,h*0.5), QColor(ACC))
+        col = QColor(ACC) if self._active else (QColor(210,222,242) if self._hover else QColor(150,168,200))
+        _glyph(p, self._icon, w/2, h*0.36, 22, col, 1.9)
+        p.setFont(QFont(_UI_FAM, 8, QFont.Bold if self._active else QFont.Normal))
+        p.setPen(QPen(col))
+        p.drawText(QRectF(0,h*0.56,w,h*0.4), Qt.AlignHCenter|Qt.AlignTop, self._label)
+
+
+class _QueueRow(QPushButton):
+    def __init__(self, idx, meta, current=False):
+        super().__init__(); self._idx=idx; self._meta=meta
+        self._current=current; self._hover=False
+        self.setFixedHeight(58); self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet("background:transparent;border:none;")
+        self._thumb = meta.get("cover") or _grad_cover(meta["title"]+meta["artist"], 80)
+    def set_current(self,v): self._current=v; self.update()
+    def enterEvent(self,e): self._hover=True; self.update()
+    def leaveEvent(self,e): self._hover=False; self.update()
+    def paintEvent(self,_e):
+        p=QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        w=self.width(); h=self.height()
+        if self._current or self._hover:
+            path=QPainterPath(); path.addRoundedRect(QRectF(2,3,w-4,h-6),12,12)
+            a = 40 if self._current else 16
+            p.fillPath(path, QColor(ACC.red(),ACC.green(),ACC.blue(),a))
+            if self._current:
+                pen=QPen(QColor(ACC.red(),ACC.green(),ACC.blue(),120)); pen.setWidthF(1.2)
+                p.setPen(pen); p.setBrush(Qt.NoBrush); p.drawPath(path)
+        # thumb
+        tp=QPainterPath(); tp.addRoundedRect(QRectF(12,11,36,36),8,8)
+        p.setClipPath(tp); p.drawPixmap(QRectF(12,11,36,36), self._thumb, QRectF(self._thumb.rect()))
+        p.setClipping(False)
+        # title / artist
+        tcol = QColor(ACC) if self._current else WHITE
+        p.setFont(QFont(_UI_FAM, 10, QFont.Bold)); p.setPen(QPen(tcol))
+        fm=QFontMetrics(p.font())
+        title=fm.elidedText(self._meta["title"], Qt.ElideRight, w-150)
+        p.drawText(QRectF(58,12,w-150,18), Qt.AlignVCenter|Qt.AlignLeft, title)
+        p.setFont(QFont(_UI_FAM, 8)); p.setPen(QPen(DIM))
+        p.drawText(QRectF(58,30,w-150,16), Qt.AlignVCenter|Qt.AlignLeft, self._meta["artist"])
+        # duration
+        p.setFont(QFont(_UI_FAM, 9)); p.setPen(QPen(QColor(170,186,214)))
+        p.drawText(QRectF(w-70,0,46,h), Qt.AlignVCenter|Qt.AlignRight, _fmt(self._meta["dur"]))
+        _glyph(p, "dots", w-14, h/2, 14, QColor(150,168,200), 1.6)
+
+
+# ── the window ────────────────────────────────────────────────────────
+class MusicPanel(_QtLucyWindow):
+    def __init__(self, desktop):
+        super().__init__(desktop, "Music", 1120, 700, "🎵")
+        self._mpv=_Mpv(); self._queue=[]; self._cur=-1
+        self._dur=0.0; self._pos=0.0; self._playing=False
+        self._loop=0; self._shuffle=False; self._vol=0.78
+        self._rows=[]
+        self._build()
+        self._set_cover(None, "No track", "—")   # all widgets exist now
+        self._mpv.start()
+        self._scan(MUSIC_DIR)
+        self._timer=QTimer(self); self._timer.timeout.connect(self._poll); self._timer.start(500)
+
+    # ── UI ──
+    def _build(self):
+        root=QVBoxLayout(self.content); root.setContentsMargins(0,0,0,0); root.setSpacing(0)
+        main=QHBoxLayout(); main.setContentsMargins(0,0,0,0); main.setSpacing(0)
+        main.addWidget(self._sidebar())
+        main.addWidget(self._center(), 1)
+        main.addWidget(self._queue_panel())
+        root.addLayout(main, 1)
+        root.addWidget(self._bottom())
+
+    def _sidebar(self):
+        box=QFrame(); box.setFixedWidth(140); box.setStyleSheet("background:transparent;")
+        lay=QVBoxLayout(box); lay.setContentsMargins(8,16,8,12); lay.setSpacing(2)
+        self._navs=[]
+        items=[("nowplaying","NOW PLAYING"),("discover","DISCOVER"),
+               ("library","LIBRARY"),("radio","RADIO"),
+               ("heart","FAVORITES"),("playlists","PLAYLISTS")]
+        for i,(ic,lb) in enumerate(items):
+            n=_NavItem(ic,lb, active=(i==0)); n.clicked.connect(lambda _,x=i:self._nav(x))
+            self._navs.append(n); lay.addWidget(n)
+        lay.addStretch()
+        ss=QFrame(); ss.setFixedHeight(120)
+        ss.setStyleSheet("background:rgba(255,255,255,10);border-radius:14px;")
+        sl=QVBoxLayout(ss); sl.setContentsMargins(10,8,10,8)
+        t=QLabel("SOUNDSTAGE"); t.setFont(QFont(_UI_FAM,7,QFont.Bold))
+        t.setStyleSheet("color:#8ea3c8;background:transparent;"); sl.addWidget(t)
+        self._ss=_Viz(n=22,h=70); sl.addWidget(self._ss)
+        lay.addWidget(ss)
+        return box
+
+    def _nav(self,i):
+        for j,n in enumerate(self._navs): n.set_active(j==i)
+        if i==2:  # LIBRARY → add tracks
+            self._add_files()
+
+    def _center(self):
+        box=QFrame(); box.setStyleSheet("background:transparent;")
+        lay=QVBoxLayout(box); lay.setContentsMargins(20,16,20,10); lay.setSpacing(14)
+        top=QHBoxLayout(); top.setSpacing(20)
+        # album art
+        self._art=QLabel(); self._art.setFixedSize(300,300)
+        self._art.setStyleSheet("background:transparent;")
+        top.addWidget(self._art, 0, Qt.AlignTop)
+        # info column
+        info=QVBoxLayout(); info.setSpacing(8)
+        lbl=QLabel("◦◦◦  NOW PLAYING  ◦◦◦"); lbl.setFont(QFont(_UI_FAM,8,QFont.Bold))
+        lbl.setStyleSheet(f"color:{C.get('accent','#4c8dff')};background:transparent;letter-spacing:2px;")
+        info.addWidget(lbl)
+        self._title=QLabel("No track"); self._title.setFont(QFont(_UI_FAM,26,QFont.Bold))
+        self._title.setStyleSheet("color:#eef4ff;background:transparent;"); self._title.setWordWrap(True)
+        info.addWidget(self._title)
+        self._artist=QLabel("—"); self._artist.setFont(QFont(_UI_FAM,13,QFont.Bold))
+        self._artist.setStyleSheet(f"color:{C.get('accent2','#7aa9ff')};background:transparent;")
+        info.addWidget(self._artist)
+        tags=QHBoxLayout(); tags.setSpacing(8)
+        for t in ("Audio","mpv","Lossless"):
+            c=QLabel(t); c.setFont(QFont(_UI_FAM,8,QFont.Bold))
+            c.setStyleSheet("color:#9fc0ff;background:rgba(120,160,255,28);"
+                            "border:1px solid rgba(120,160,255,60);border-radius:9px;padding:3px 10px;")
+            tags.addWidget(c)
+        tags.addStretch(); info.addLayout(tags)
+        info.addSpacing(6)
+        self._viz=_Viz(n=44,h=70); info.addWidget(self._viz)
+        info.addStretch()
+        top.addLayout(info, 1)
+        lay.addLayout(top, 1)
+        # scrub + times
+        sc=QHBoxLayout(); sc.setSpacing(10)
+        self._t_l=QLabel("0:00"); self._t_r=QLabel("0:00")
+        for L in (self._t_l,self._t_r):
+            L.setFont(QFont(_UI_FAM,9)); L.setStyleSheet("color:#9fb2d6;background:transparent;")
+        self._scrub=_Scrub(); self._scrub.seek.connect(self._seek)
+        sc.addWidget(self._t_l); sc.addWidget(self._scrub,1); sc.addWidget(self._t_r)
+        lay.addLayout(sc)
+        # transport
+        tr=QHBoxLayout(); tr.setSpacing(20); tr.addStretch()
+        self._b_shuf=_IconBtn("shuffle",40); self._b_shuf.clicked.connect(self._toggle_shuffle)
+        b_prev=_IconBtn("prev",44); b_prev.clicked.connect(lambda:self._mpv.prev())
+        self._b_play=_IconBtn("play",72,glyph_scale=0.4,primary=True); self._b_play.clicked.connect(self._toggle)
+        b_next=_IconBtn("next",44); b_next.clicked.connect(lambda:self._mpv.next())
+        self._b_loop=_IconBtn("repeat",40); self._b_loop.clicked.connect(self._toggle_loop)
+        for b in (self._b_shuf,b_prev,self._b_play,b_next,self._b_loop): tr.addWidget(b)
+        tr.addStretch(); lay.addLayout(tr)
+        return box
+
+    def _queue_panel(self):
+        box=QFrame(); box.setFixedWidth(330)
+        box.setStyleSheet("background:rgba(255,255,255,8);border-radius:0px;")
+        lay=QVBoxLayout(box); lay.setContentsMargins(14,16,10,12); lay.setSpacing(8)
+        hd=QHBoxLayout()
+        t=QLabel("PLAY QUEUE"); t.setFont(QFont(_UI_FAM,11,QFont.Bold))
+        t.setStyleSheet("color:#eef4ff;background:transparent;letter-spacing:1px;")
+        self._qcount=QLabel("0 TRACKS"); self._qcount.setFont(QFont(_UI_FAM,8,QFont.Bold))
+        self._qcount.setStyleSheet(f"color:{C.get('accent','#4c8dff')};background:transparent;")
+        hd.addWidget(t); hd.addSpacing(6); hd.addWidget(self._qcount); hd.addStretch()
+        bs=_IconBtn("search",26,0.6); bs.clicked.connect(self._add_files)
+        hd.addWidget(bs)
+        lay.addLayout(hd)
+        self._scroll=QScrollArea(); self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}"
+            "QScrollBar:vertical{background:transparent;width:6px;}"
+            "QScrollBar::handle:vertical{background:rgba(255,255,255,45);border-radius:3px;}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}")
+        self._host=QWidget(); self._host.setStyleSheet("background:transparent;")
+        self._qlay=QVBoxLayout(self._host); self._qlay.setContentsMargins(0,0,6,0); self._qlay.setSpacing(2)
+        self._qlay.addStretch()
+        self._scroll.setWidget(self._host)
+        lay.addWidget(self._scroll,1)
+        ft=QHBoxLayout()
+        self._qfoot=QLabel("0 TRACKS"); self._qfoot.setFont(QFont(_UI_FAM,8))
+        self._qfoot.setStyleSheet("color:#8ea3c8;background:transparent;")
+        clr=QPushButton("CLEAR"); clr.setCursor(Qt.PointingHandCursor)
+        clr.setStyleSheet(f"color:{C.get('accent','#4c8dff')};background:transparent;border:none;font:bold 9px '{_UI_FAM}';")
+        clr.clicked.connect(self._clear)
+        ft.addWidget(self._qfoot); ft.addStretch(); ft.addWidget(clr)
+        lay.addLayout(ft)
+        return box
+
+    def _bottom(self):
+        bar=QFrame(); bar.setFixedHeight(64)
+        bar.setStyleSheet("background:rgba(255,255,255,8);border-top:1px solid rgba(255,255,255,22);")
+        lay=QHBoxLayout(bar); lay.setContentsMargins(16,8,16,8); lay.setSpacing(14)
+        self._mini_art=QLabel(); self._mini_art.setFixedSize(44,44)
+        lay.addWidget(self._mini_art)
+        mc=QVBoxLayout(); mc.setSpacing(0)
+        self._mini_t=QLabel("No track"); self._mini_t.setFont(QFont(_UI_FAM,10,QFont.Bold))
+        self._mini_t.setStyleSheet("color:#eef4ff;background:transparent;")
+        self._mini_a=QLabel("—"); self._mini_a.setFont(QFont(_UI_FAM,8))
+        self._mini_a.setStyleSheet("color:#8ea3c8;background:transparent;")
+        mc.addWidget(self._mini_t); mc.addWidget(self._mini_a)
+        lay.addLayout(mc)
+        self._wave=_Wave(); lay.addWidget(self._wave,1)
+        bv=_IconBtn("vol",30,0.62); lay.addWidget(bv)
+        self._volw=_VolSlider(self._vol); self._volw.changed.connect(self._set_vol); lay.addWidget(self._volw)
+        self._vpct=QLabel("78%"); self._vpct.setFont(QFont(_UI_FAM,9))
+        self._vpct.setStyleSheet("color:#9fb2d6;background:transparent;"); lay.addWidget(self._vpct)
+        lay.addSpacing(6)
+        for nm in ("eq","moon","expand"):
+            b=_IconBtn(nm,32,0.6)
+            if nm=="expand": b.clicked.connect(self._restore)
+            lay.addWidget(b)
+        return bar
+
+    # ── cover / now-playing ──
+    def _set_cover(self, pm, title, artist):
+        if pm is None: pm=_grad_cover(title+artist, 300)
+        big=pm.scaled(300,300,Qt.KeepAspectRatioByExpanding,Qt.SmoothTransformation)
+        rp=QPixmap(300,300); rp.fill(Qt.transparent)
+        p=QPainter(rp); p.setRenderHint(QPainter.Antialiasing); p.setRenderHint(QPainter.SmoothPixmapTransform)
+        path=QPainterPath(); path.addRoundedRect(QRectF(0,0,300,300),18,18); p.setClipPath(path)
+        p.drawPixmap(0,0,big); p.setClipping(False)
+        pen=QPen(QColor(255,255,255,40)); pen.setWidthF(1.4); p.setPen(pen); p.setBrush(Qt.NoBrush); p.drawPath(path)
+        p.end(); self._art.setPixmap(rp)
+        # mini
+        mp=pm.scaled(44,44,Qt.KeepAspectRatioByExpanding,Qt.SmoothTransformation)
+        rm=QPixmap(44,44); rm.fill(Qt.transparent)
+        p2=QPainter(rm); p2.setRenderHint(QPainter.Antialiasing); p2.setRenderHint(QPainter.SmoothPixmapTransform)
+        pp=QPainterPath(); pp.addRoundedRect(QRectF(0,0,44,44),9,9); p2.setClipPath(pp); p2.drawPixmap(0,0,mp); p2.end()
+        self._mini_art.setPixmap(rm)
+        self._title.setText(title); self._artist.setText(artist)
+        self._mini_t.setText(title); self._mini_a.setText(artist)
+
+    # ── library / queue ──
+    def _scan(self, folder):
+        files=[]
+        try:
+            for root,_,names in os.walk(folder):
+                for n in sorted(names):
+                    if n.lower().endswith(EXTS): files.append(os.path.join(root,n))
+        except Exception: pass
+        if files: self._load_files(files)
+
+    def _add_files(self):
+        try:
+            paths,_=QFileDialog.getOpenFileNames(self,"Add tracks", MUSIC_DIR,
+                "Audio (*.mp3 *.flac *.wav *.m4a *.ogg *.opus *.aac);;All files (*.*)")
+            if paths: self._load_files(paths, append=True)
+        except Exception: pass
+
+    def _load_files(self, paths, append=False):
+        was=len(self._queue)
+        for p in paths:
+            if p not in [q["path"] for q in self._queue]:
+                m=_read_meta(p); m["path"]=p; self._queue.append(m)
+        self._mpv.set_playlist([q["path"] for q in self._queue])
+        self._rebuild_queue()
+        if not append or self._cur<0:
+            self._play_index(was if append and was<len(self._queue) else 0)
+
+    def _rebuild_queue(self):
+        for r in self._rows:
+            try: r.setParent(None)
+            except Exception: pass
+        self._rows=[]
+        # insert rows before the trailing stretch
+        for i,m in enumerate(self._queue):
+            row=_QueueRow(i,m,current=(i==self._cur))
+            row.clicked.connect(lambda _,x=i:self._play_index(x))
+            self._qlay.insertWidget(self._qlay.count()-1, row); self._rows.append(row)
+        total=sum(m["dur"] for m in self._queue)
+        self._qcount.setText(f"{len(self._queue)} TRACKS")
+        self._qfoot.setText(f"{len(self._queue)} TRACKS · {_fmt(total)}")
+
+    def _clear(self):
+        self._queue=[]; self._cur=-1; self._mpv.set_playlist([]); self._mpv._cmd("stop")
+        self._rebuild_queue(); self._set_cover(None,"No track","—"); self._playing=False
+        self._b_play.set_name("play")
+
+    def _play_index(self,i):
+        if not (0<=i<len(self._queue)): return
+        self._cur=i; self._mpv.play_index(i)
+        m=self._queue[i]; self._dur=m["dur"] or 0.0
+        self._set_cover(m.get("cover"), m["title"], m["artist"])
+        for j,r in enumerate(self._rows): r.set_current(j==i)
+        self._playing=True; self._b_play.set_name("pause")
+        self._viz.set_playing(True); self._ss.set_playing(True); self._wave.set_playing(True)
+
+    # ── controls ──
+    def _toggle(self):
+        if self._cur<0 and self._queue: self._play_index(0); return
+        self._mpv.toggle(); self._playing=not self._playing
+        self._b_play.set_name("pause" if self._playing else "play")
+        for v in (self._viz,self._ss,self._wave): v.set_playing(self._playing)
+    def _seek(self,frac):
+        if self._dur>0: self._mpv.seek(frac*self._dur)
+    def _set_vol(self,v):
+        self._vol=v; self._mpv.set_vol(v*100); self._vpct.setText(f"{int(v*100)}%")
+    def _toggle_shuffle(self):
+        self._shuffle=not self._shuffle; self._mpv.set_shuffle(self._shuffle)
+        self._b_shuf.set_on(self._shuffle)
+    def _toggle_loop(self):
+        self._loop=(self._loop+1)%3; self._mpv.set_loop(self._loop)
+        self._b_loop.set_on(self._loop>0)
+
+    def _poll(self):
+        if not self._mpv._proc: return
+        d=self._mpv.dur()
+        if isinstance(d,(int,float)) and d>0: self._dur=float(d)
+        pos=self._mpv.pos()
+        if isinstance(pos,(int,float)): self._pos=float(pos)
+        pa=self._mpv.paused()
+        if pa is not None and (not pa)!=self._playing:
+            self._playing=not pa; self._b_play.set_name("pause" if self._playing else "play")
+            for v in (self._viz,self._ss,self._wave): v.set_playing(self._playing)
+        idx=self._mpv.index()
+        if isinstance(idx,int) and idx!=self._cur and 0<=idx<len(self._queue):
+            self._cur=idx; m=self._queue[idx]
+            self._set_cover(m.get("cover"),m["title"],m["artist"])
+            for j,r in enumerate(self._rows): r.set_current(j==idx)
+        if self._dur>0: self._scrub.set_progress(self._pos/self._dur)
+        self._t_l.setText(_fmt(self._pos)); self._t_r.setText(_fmt(self._dur))
+
+    def _close(self):
+        # The red hex calls _close() directly (NOT closeEvent), so this is
+        # where we must stop mpv — otherwise the audio keeps playing after
+        # the window is gone (the "phantom sound" bug).
+        try: self._mpv.stop()
+        except Exception: pass
+        try: super()._close()
+        except Exception: pass
+
+    def closeEvent(self,e):
+        try: self._mpv.stop()
+        except Exception: pass
+        try: super().closeEvent(e)
+        except Exception: e.accept()
+
+
+def main(desktop=None):
+    if desktop is None: return None
+    return MusicPanel(desktop)

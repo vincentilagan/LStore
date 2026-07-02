@@ -1,0 +1,434 @@
+# VX:name=Video
+# VX:icon=🎬
+# VX:version=3.0
+# VX:sig=WERI3P1GMZvFROt5H76gDzTcBUK4GLOErc+/L5JcPHLHif14oo2TJ38m3D0nhn1SuGh3JsRokF22P7dwMlphBA==
+"""
+Luci Video — modern player built on the STANDARD Luci window.
+
+Window chrome (the 🔴🟡🔵 close / minimise / maximise hex buttons, the
+title bar, drag, resize, workspace tagging, minimise-to-dock) all come
+from `_QtLucyWindow` — the same standard window class FileManager,
+Settings, Gate, the App Launcher etc. use. We do NOT draw our own
+window buttons; we only fill `self.content` with the player UI.
+
+Playback: mpv embedded via --wid so frames paint straight into our
+surface (zero-copy, software decode, no GPU needed), driven over a
+JSON-IPC unix socket.
+"""
+
+import os, sys, json, socket, time, math, subprocess
+from PyQt5.QtCore    import Qt, QTimer, QRectF, QPointF, pyqtSignal
+from PyQt5.QtGui     import (QFont, QColor, QPainter, QPen, QBrush,
+                              QPainterPath, QLinearGradient, QRadialGradient)
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                              QPushButton, QFileDialog, QApplication)
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from luci import _QtLucyWindow, C, _UI_FAM
+
+ACC = QColor(C.get("accent", "#4c8dff"))
+
+
+# ── thin Material-Symbols-style icon drawing (playback controls only) ──
+def _stroke(p, color, w=2.0):
+    pen = QPen(color); pen.setWidthF(w)
+    pen.setCapStyle(Qt.RoundCap); pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen); p.setBrush(Qt.NoBrush)
+
+
+def draw_glyph(p, name, cx, cy, s, color, w=1.9):
+    r = s / 2.0
+    p.save(); _stroke(p, color, w)
+    if name == "play":
+        path = QPainterPath()
+        path.moveTo(cx - r*.45, cy - r*.7); path.lineTo(cx + r*.75, cy)
+        path.lineTo(cx - r*.45, cy + r*.7); path.closeSubpath()
+        p.setBrush(QBrush(color)); p.setPen(Qt.NoPen); p.drawPath(path)
+    elif name == "pause":
+        p.setBrush(QBrush(color)); p.setPen(Qt.NoPen)
+        bw = r*.32
+        p.drawRoundedRect(QRectF(cx - r*.55, cy - r*.7, bw, r*1.4), 2, 2)
+        p.drawRoundedRect(QRectF(cx + r*.22, cy - r*.7, bw, r*1.4), 2, 2)
+    elif name in ("prev", "next"):
+        sign = -1 if name == "prev" else 1
+        p.setBrush(QBrush(color)); p.setPen(Qt.NoPen)
+        bx = cx + sign*r*.7
+        p.drawRoundedRect(QRectF(bx - (r*.16 if sign > 0 else 0),
+                                 cy - r*.6, r*.16, r*1.2), 1.5, 1.5)
+        path = QPainterPath()
+        path.moveTo(cx + sign*r*.6, cy - r*.55); path.lineTo(cx - sign*r*.4, cy)
+        path.lineTo(cx + sign*r*.6, cy + r*.55); path.closeSubpath()
+        p.drawPath(path)
+    elif name == "volume":
+        p.setBrush(QBrush(color)); p.setPen(Qt.NoPen)
+        spk = QPainterPath()
+        spk.moveTo(cx - r*.8, cy - r*.3); spk.lineTo(cx - r*.4, cy - r*.3)
+        spk.lineTo(cx + r*.05, cy - r*.7); spk.lineTo(cx + r*.05, cy + r*.7)
+        spk.lineTo(cx - r*.4, cy + r*.3); spk.lineTo(cx - r*.8, cy + r*.3)
+        spk.closeSubpath(); p.drawPath(spk)
+        _stroke(p, color, w)
+        for k in (0.35, 0.62):
+            p.drawArc(QRectF(cx + r*.1 - r*k, cy - r*k, r*k*2, r*k*2),
+                      -55*16, 110*16)
+    elif name == "gear":
+        _stroke(p, color, w); p.drawEllipse(QPointF(cx, cy), r*.35, r*.35)
+        for i in range(8):
+            a = math.pi/4 * i
+            p.drawLine(QPointF(cx + math.cos(a)*r*.55, cy + math.sin(a)*r*.55),
+                       QPointF(cx + math.cos(a)*r*.85, cy + math.sin(a)*r*.85))
+    elif name == "pip":
+        _stroke(p, color, w)
+        p.drawRoundedRect(QRectF(cx - r*.8, cy - r*.6, r*1.6, r*1.2), 3, 3)
+        p.setBrush(QBrush(color)); p.setPen(Qt.NoPen)
+        p.drawRoundedRect(QRectF(cx + r*.05, cy, r*.65, r*.5), 2, 2)
+    elif name == "fullscreen":
+        for (sx, sy) in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+            x0, y0 = cx + sx*r*.7, cy + sy*r*.7
+            p.drawLine(QPointF(x0, y0), QPointF(x0 - sx*r*.4, y0))
+            p.drawLine(QPointF(x0, y0), QPointF(x0, y0 - sy*r*.4))
+    p.restore()
+
+
+class _LineBtn(QPushButton):
+    def __init__(self, name, size=34, box=False, glyph_scale=0.6, text=None):
+        super().__init__()
+        self._name = name; self._box = box; self._gs = glyph_scale
+        self._text = text; self._hover = False
+        self.setFixedSize(size, size); self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet("background:transparent;border:none;")
+    def enterEvent(self, e): self._hover = True;  self.update()
+    def leaveEvent(self, e): self._hover = False; self.update()
+    def paintEvent(self, _e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        col = QColor(235, 242, 255) if self._hover else QColor(200, 214, 238)
+        if self._box:
+            rect = QRectF(2, h/2 - w*0.34, w - 4, w*0.68)
+            path = QPainterPath(); path.addRoundedRect(rect, 7, 7)
+            if self._hover: p.fillPath(path, QColor(255, 255, 255, 26))
+            pen = QPen(QColor(255, 255, 255, 70 if self._hover else 45))
+            pen.setWidthF(1.3); p.setPen(pen); p.setBrush(Qt.NoBrush); p.drawPath(path)
+        if self._text:
+            p.setFont(QFont(_UI_FAM, int(w*0.30), QFont.Bold)); p.setPen(QPen(col))
+            p.drawText(self.rect(), Qt.AlignCenter, self._text)
+        else:
+            draw_glyph(p, self._name, w/2, h/2, w*self._gs, col, 1.9)
+
+
+class _PlayBtn(QPushButton):
+    def __init__(self, size=52):
+        super().__init__()
+        self._paused = True; self._hover = False
+        self.setFixedSize(size, size); self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet("background:transparent;border:none;")
+    def set_paused(self, v): self._paused = v; self.update()
+    def enterEvent(self, e): self._hover = True;  self.update()
+    def leaveEvent(self, e): self._hover = False; self.update()
+    def paintEvent(self, _e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        w = self.width()
+        path = QPainterPath(); path.addRoundedRect(QRectF(1, 1, w-2, w-2),
+                                                   w*0.28, w*0.28)
+        g = QLinearGradient(0, 0, 0, w)
+        base = ACC.lighter(112) if self._hover else ACC
+        g.setColorAt(0, base.lighter(108)); g.setColorAt(1, base.darker(110))
+        p.fillPath(path, g)
+        draw_glyph(p, "pause" if not self._paused else "play",
+                   w/2 + (0 if not self._paused else w*0.03), w/2,
+                   w*0.46, QColor(255, 255, 255), 2)
+
+
+class _ScrubBar(QWidget):
+    seek = pyqtSignal(float)
+    def __init__(self):
+        super().__init__(); self.setFixedHeight(30); self.setMouseTracking(True)
+        self._progress = 0.0; self._hover_x = None; self._drag = False; self._dur = 0.0
+    def set_progress(self, x): self._progress = max(0, min(1, x)); self.update()
+    def set_duration(self, d): self._dur = d
+    def _fmt(self, s): s = int(max(0, s)); return f"{s//60}:{s%60:02d}"
+    def _frac(self, x): return max(0, min(1, x / max(1, self.width())))
+    def mousePressEvent(self, e): self._drag = True; self._progress = self._frac(e.x()); self.update()
+    def mouseMoveEvent(self, e):
+        self._hover_x = e.x()
+        if self._drag: self._progress = self._frac(e.x())
+        self.update()
+    def mouseReleaseEvent(self, e):
+        if self._drag: self._drag = False; self.seek.emit(self._frac(e.x()))
+    def leaveEvent(self, e): self._hover_x = None; self.update()
+    def paintEvent(self, _e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        w = self.width(); cy = self.height() - 10
+        pen = QPen(QColor(255, 255, 255, 55)); pen.setWidthF(4); pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen); p.drawLine(QPointF(4, cy), QPointF(w-4, cy))
+        hx = 4 + (w-8)*self._progress
+        pen = QPen(ACC); pen.setWidthF(4); pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen); p.drawLine(QPointF(4, cy), QPointF(hx, cy))
+        p.setPen(Qt.NoPen); p.setBrush(QColor(255, 255, 255)); p.drawEllipse(QPointF(hx, cy), 7, 7)
+        if self._hover_x is not None or self._drag:
+            bx = hx if self._drag else self._hover_x
+            frac = self._progress if self._drag else self._frac(self._hover_x)
+            txt = self._fmt(frac * self._dur)
+            p.setFont(QFont(_UI_FAM, 9, QFont.Bold))
+            tw = p.fontMetrics().horizontalAdvance(txt) + 16
+            bx = max(tw/2, min(w - tw/2, bx))
+            br = QRectF(bx - tw/2, 0, tw, 18)
+            path = QPainterPath(); path.addRoundedRect(br, 6, 6)
+            p.fillPath(path, QColor(20, 28, 48, 235))
+            p.setPen(QPen(QColor(235, 242, 255))); p.drawText(br, Qt.AlignCenter, txt)
+
+
+class _VolSlider(QWidget):
+    changed = pyqtSignal(float)
+    def __init__(self):
+        super().__init__(); self.setFixedSize(88, 24); self._v = 0.8
+    def _set(self, x):
+        self._v = max(0, min(1, x / max(1, self.width()))); self.update(); self.changed.emit(self._v)
+    def mousePressEvent(self, e): self._set(e.x())
+    def mouseMoveEvent(self, e):
+        if e.buttons() & Qt.LeftButton: self._set(e.x())
+    def paintEvent(self, _e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        w = self.width(); cy = self.height()/2
+        pen = QPen(QColor(255, 255, 255, 55)); pen.setWidthF(4); pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen); p.drawLine(QPointF(4, cy), QPointF(w-4, cy))
+        hx = 4 + (w-8)*self._v
+        pen = QPen(ACC); pen.setWidthF(4); pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen); p.drawLine(QPointF(4, cy), QPointF(hx, cy))
+        p.setPen(Qt.NoPen); p.setBrush(QColor(255, 255, 255)); p.drawEllipse(QPointF(hx, cy), 6, 6)
+
+
+# ── mpv backend ───────────────────────────────────────────────────────
+class _MpvProc:
+    SOCK = "/tmp/luci-mpv.sock"
+    def __init__(self, wid):
+        self._wid = wid; self._proc = None; self._sock = None
+        self._avail = self._which("mpv") is not None
+    @staticmethod
+    def _which(name):
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            cand = os.path.join(d, name)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK): return cand
+        for cand in (f"/usr/local/bin/{name}", f"/usr/bin/{name}"):
+            if os.path.isfile(cand): return cand
+        return None
+    def available(self): return self._avail
+    def start(self, path):
+        self.stop()
+        if not self._avail: return False
+        try:
+            try: os.unlink(self.SOCK)
+            except FileNotFoundError: pass
+            cmd = [self._which("mpv") or "/usr/local/bin/mpv",
+                   f"--wid={int(self._wid)}", f"--input-ipc-server={self.SOCK}",
+                   "--no-osc", "--no-input-default-bindings", "--idle=yes",
+                   "--keep-open=yes", "--ao=oss", "--audio-device=oss//dev/dsp0",
+                   "--vo=x11", path]
+            self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL, start_new_session=True)
+            for _ in range(40):
+                if os.path.exists(self.SOCK): break
+                time.sleep(0.05)
+            return True
+        except Exception: return False
+    def stop(self):
+        try: self._send(["quit"])
+        except Exception: pass
+        try:
+            if self._proc and self._proc.poll() is None:
+                self._proc.terminate()
+                try: self._proc.wait(timeout=1)
+                except Exception:
+                    import signal
+                    try: os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+                    except Exception:
+                        try: self._proc.kill()
+                        except Exception: pass
+        except Exception: pass
+        self._proc = None
+        if self._sock:
+            try: self._sock.close()
+            except Exception: pass
+            self._sock = None
+    def _send(self, cmd):
+        # Match by request_id, skip interleaved async events (a single
+        # recv() returned event data → wrong pos/duration).
+        if not self._proc: return None
+        try:
+            if self._sock is None:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(0.5); s.connect(self.SOCK); self._sock = s
+            self._rid = (getattr(self, "_rid", 0) % 1000000) + 1
+            rid = self._rid
+            self._sock.send((json.dumps(
+                {"command": cmd, "request_id": rid}) + "\n").encode())
+            buf = b""
+            t0 = time.time()
+            while time.time() - t0 < 0.6:
+                try: chunk = self._sock.recv(8192)
+                except socket.timeout: break
+                if not chunk: break
+                buf += chunk
+                parts = buf.split(b"\n"); buf = parts.pop()
+                for line in parts:
+                    try: j = json.loads(line.decode("utf-8", "ignore"))
+                    except Exception: continue
+                    if j.get("request_id") == rid:
+                        return j.get("data")
+            return None
+        except Exception:
+            try: self._sock.close()
+            except Exception: pass
+            self._sock = None
+        return None
+    def toggle_pause(self):  return self._send(["cycle", "pause"])
+    def seek_abs(self, sec): return self._send(["seek", float(sec), "absolute"])
+    def set_vol(self, v):    return self._send(["set_property", "volume", v])
+    def get_pos(self):       return self._send(["get_property", "time-pos"])
+    def get_duration(self):  return self._send(["get_property", "duration"])
+    def is_paused(self):
+        r = self._send(["get_property", "pause"])
+        return bool(r) if r is not None else None
+
+
+class _VideoSurface(QWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_NativeWindow, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self.setAutoFillBackground(False)
+        self._placeholder = "Double-click to open a video"
+    def paintEvent(self, _e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect()
+        path = QPainterPath(); path.addRoundedRect(QRectF(r), 12, 12)
+        grad = QLinearGradient(0, 0, 0, self.height())
+        grad.setColorAt(0, QColor(10, 16, 34)); grad.setColorAt(1, QColor(4, 8, 20))
+        p.fillPath(path, grad)
+        p.setFont(QFont(_UI_FAM, 12)); p.setPen(QPen(QColor(140, 170, 210, 170)))
+        p.drawText(r, Qt.AlignCenter, self._placeholder)
+
+
+# ── the window: STANDARD Luci chrome + player content ─────────────────
+class VideoPanel(_QtLucyWindow):
+    def __init__(self, desktop):
+        super().__init__(desktop, "Video", 960, 600, "🎬")
+        self._mpv = None
+        self._duration = 0.0; self._position = 0.0
+        self._playing = False; self._track = None
+        self._build_content()
+        self._timer = QTimer(self); self._timer.timeout.connect(self._poll)
+        self._timer.start(500)
+
+    def _build_content(self):
+        lay = QVBoxLayout(self.content)
+        lay.setContentsMargins(14, 12, 14, 14); lay.setSpacing(10)
+
+        self._surface = _VideoSurface(self.content)
+        self._surface.setMinimumHeight(320)
+        lay.addWidget(self._surface, 1)
+
+        self._scrub = _ScrubBar(); self._scrub.seek.connect(self._seek_to)
+        lay.addWidget(self._scrub)
+
+        row = QHBoxLayout(); row.setSpacing(10)
+        self._b_play = _PlayBtn(50); self._b_play.clicked.connect(self._toggle)
+        b_prev = _LineBtn("prev", 34); b_next = _LineBtn("next", 34)
+        b_prev.clicked.connect(lambda: self._nudge(-10))
+        b_next.clicked.connect(lambda: self._nudge(+10))
+        row.addWidget(self._b_play); row.addSpacing(4)
+        row.addWidget(b_prev); row.addWidget(b_next); row.addSpacing(8)
+        self._time = QLabel("0:00 / 0:00")
+        self._time.setFont(QFont(_UI_FAM, 10))
+        self._time.setStyleSheet("color:#8ea3c8;background:transparent;")
+        row.addWidget(self._time); row.addStretch()
+        b_vol = _LineBtn("volume", 30); self._vol = _VolSlider()
+        self._vol.changed.connect(self._set_vol)
+        row.addWidget(b_vol); row.addWidget(self._vol); row.addSpacing(8)
+        b_cc = _LineBtn("cc", 36, box=True, text="CC")
+        b_gear = _LineBtn("gear", 36, box=True, glyph_scale=0.5)
+        b_pip = _LineBtn("pip", 36, box=True, glyph_scale=0.5)
+        b_fs = _LineBtn("fullscreen", 36, box=True, glyph_scale=0.5)
+        b_fs.clicked.connect(self._toggle_max)
+        for b in (b_cc, b_gear, b_pip, b_fs): row.addWidget(b)
+        lay.addLayout(row)
+
+    # ── playback ──
+    def _open(self):
+        try:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Open a video", "",
+                "Video (*.mp4 *.mkv *.webm *.avi *.mov);;All files (*.*)")
+            if path: self.load(path)
+        except Exception: pass
+
+    def load(self, path):
+        self._track = path
+        if self._mpv is None: self._mpv = _MpvProc(self._surface.winId())
+        if not self._mpv.available():
+            self._surface._placeholder = "mpv not installed — pkg install mpv"
+            self._surface.update(); return
+        if not self._mpv.start(path):
+            self._surface._placeholder = "Failed to start mpv"
+            self._surface.update(); return
+        self._playing = True; self._b_play.set_paused(False)
+
+    def _toggle(self):
+        if self._mpv and self._mpv._proc:
+            self._mpv.toggle_pause(); self._playing = not self._playing
+            self._b_play.set_paused(not self._playing)
+        elif self._track is None: self._open()
+
+    def _nudge(self, sec):
+        if self._duration > 0 and self._mpv and self._mpv._proc:
+            self._mpv.seek_abs(max(0, self._position + sec))
+    def _seek_to(self, frac):
+        if self._duration > 0 and self._mpv and self._mpv._proc:
+            self._mpv.seek_abs(frac * self._duration)
+    def _set_vol(self, v):
+        if self._mpv and self._mpv._proc: self._mpv.set_vol(int(v*100))
+
+    def _toggle_max(self):
+        # Use the standard window's maximise/restore.
+        try: self._restore()
+        except Exception: pass
+
+    def _poll(self):
+        if not (self._mpv and self._mpv._proc): return
+        d = self._mpv.get_duration()
+        if isinstance(d, (int, float)) and d > 0: self._duration = float(d)
+        pos = self._mpv.get_pos()
+        if isinstance(pos, (int, float)): self._position = float(pos)
+        paused = self._mpv.is_paused()
+        if paused is not None and (not paused) != self._playing:
+            self._playing = not paused; self._b_play.set_paused(not self._playing)
+        if self._duration > 0:
+            self._scrub.set_duration(self._duration)
+            self._scrub.set_progress(self._position / self._duration)
+        def fmt(s): s = int(max(0, s)); return f"{s//60}:{s%60:02d}"
+        self._time.setText(f"{fmt(self._position)} / {fmt(self._duration)}")
+
+    def mouseDoubleClickEvent(self, e):
+        self._open()
+
+    def _close(self):
+        # Red hex calls _close() directly (not closeEvent) → stop mpv here
+        # too, else the video's audio keeps playing after it closes.
+        try:
+            if self._mpv: self._mpv.stop()
+        except Exception: pass
+        try: super()._close()
+        except Exception: pass
+
+    def closeEvent(self, e):
+        try:
+            if self._mpv: self._mpv.stop()
+        except Exception: pass
+        try: super().closeEvent(e)
+        except Exception: e.accept()
+
+
+def main(desktop=None):
+    if desktop is None:
+        return None
+    return VideoPanel(desktop)
