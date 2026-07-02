@@ -1,0 +1,21 @@
+{
+  "store": "LStore",
+  "section": "Software",
+  "note": "Native FreeBSD apps installed with pkg. Installing one also creates a Luci launcher (LuciNativeApp .vx) and pulls the app's icon into the Launchpad.",
+  "apps": [
+    {"id": "blender", "name": "Blender", "pkg": "blender", "bin": "blender", "icon": "🧊", "category": "Software", "summary": "3D creation suite — modelling, animation, render."},
+    {"id": "gimp", "name": "GIMP", "pkg": "gimp", "bin": "gimp", "icon": "🖼️", "category": "Software", "summary": "Powerful raster image editor (Photoshop-class)."},
+    {"id": "krita", "name": "Krita", "pkg": "krita", "bin": "krita", "icon": "🎨", "category": "Software", "summary": "Digital painting studio."},
+    {"id": "inkscape", "name": "Inkscape", "pkg": "inkscape", "bin": "inkscape", "icon": "✏️", "category": "Software", "summary": "Vector graphics editor."},
+    {"id": "audacity", "name": "Audacity", "pkg": "audacity", "bin": "audacity", "icon": "🎵", "category": "Software", "summary": "Multitrack audio editor."},
+    {"id": "vlc", "name": "VLC", "pkg": "vlc", "bin": "vlc", "icon": "▶️", "category": "Software", "summary": "Plays every media format."},
+    {"id": "obs", "name": "OBS Studio", "pkg": "obs-studio", "bin": "obs", "icon": "🎥", "category": "Software", "summary": "Screen recording and live streaming."},
+    {"id": "kdenlive", "name": "Kdenlive", "pkg": "kdenlive", "bin": "kdenlive", "icon": "🎬", "category": "Software", "summary": "Non-linear video editor."},
+    {"id": "shotcut", "name": "Shotcut", "pkg": "shotcut", "bin": "shotcut", "icon": "🎞️", "category": "Software", "summary": "Cross-platform video editor."},
+    {"id": "godot", "name": "Godot", "pkg": "godot", "bin": "godot", "icon": "🎮", "category": "Software", "summary": "Open-source game engine."},
+    {"id": "libreoffice", "name": "LibreOffice", "pkg": "libreoffice", "bin": "libreoffice", "icon": "📄", "category": "Software", "summary": "Full office suite — opens Word, Excel, PowerPoint."},
+    {"id": "firefox", "name": "Firefox", "pkg": "firefox", "bin": "firefox", "icon": "🌐", "category": "Software", "summary": "Web browser."},
+    {"id": "thunderbird", "name": "Thunderbird", "pkg": "thunderbird", "bin": "thunderbird", "icon": "✉️", "category": "Software", "summary": "Email client."},
+    {"id": "darktable", "name": "darktable", "pkg": "darktable", "bin": "darktable", "icon": "📷", "category": "Software", "summary": "RAW photo workflow (Lightroom-class)."}
+  ]
+}
