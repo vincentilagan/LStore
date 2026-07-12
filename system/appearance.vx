@@ -1,0 +1,907 @@
+# VX:name=Appearance
+# VX:icon=🎨
+# VX:version=2.0
+# VX:author=Vincent Ilagan
+# VX:sig=7ndJRqFi7pNIUAUxTIaMwCw/NxN2eHS+Kixlan/5IkpU+qDHG8oIIKdpmEwxLSVXvEwSlTtTI/mkw4cTzReZBQ==
+"""
+appearance.vx — Luci OS Appearance Settings (v2).
+
+A proper System-Settings-style layout: a category sidebar on the left,
+a panel of controls on the right. Categories follow the full Luci
+appearance spec. Controls that apply LIVE today:
+
+  • Theme      → apply_theme() + saved to the user profile (full on restart)
+  • Wallpaper  → set_user_wallpaper() (live)
+  • Animated icons → Launchpad plays <appkey>.gif/.webp
+  • Icon folder (Advanced) → opens the appicons folder in Files
+
+Every other control is a REAL control that persists your choice to
+~/.config/luci/appearance.json (live-apply is being wired in progressively,
+category by category — nothing here is a dead toggle).
+"""
+import os, sys, json
+from importlib.machinery import SourceFileLoader
+
+from PyQt5.QtCore    import Qt
+from PyQt5.QtGui     import QFont, QColor
+from PyQt5.QtWidgets import (QLabel, QCheckBox, QPushButton, QFrame, QSlider,
+                             QComboBox, QVBoxLayout, QHBoxLayout, QScrollArea,
+                             QWidget, QListWidget, QListWidgetItem,
+                             QStackedWidget, QFileDialog, QApplication,
+                             QSizePolicy)
+
+PROG = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, PROG)
+_app = SourceFileLoader("luci_app", os.path.join(PROG, "app.vx")).load_module()
+LuciWindow = _app.LuciWindow
+
+# Optional live hooks from luci core (guarded — app still works without them).
+try:
+    from luci import THEMES, apply_theme, _user, _save_user
+except Exception:
+    THEMES, apply_theme, _user, _save_user = {}, None, None, None
+
+PREFS = os.path.join(os.path.expanduser("~"), ".config", "luci", "appearance.json")
+APPICONS = os.path.join(os.path.expanduser("~"), ".config", "luci", "appicons")
+
+
+def _load():
+    try:
+        with open(PREFS, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+# ── the spec: category → list of control tuples ──────────────────────────
+#   ("theme",) ("wallpaper",) ("animated",) ("folder",)  → special, live
+#   ("toggle", key, label, default)
+#   ("slider", key, label, min, max, default)
+#   ("choice", key, label, [options])
+#   ("swatch", key, label, [(name,hex), ...])
+#   ("note", text)
+_ACCENTS = [("Blue", "#4c8dff"), ("Purple", "#a06bff"), ("Pink", "#ff6bcb"),
+            ("Red", "#ff5f57"), ("Orange", "#ff9f43"), ("Yellow", "#febc2e"),
+            ("Green", "#38d39f"), ("Gray", "#8ca2c8")]
+
+# Palettes applied live over the base dark theme (they override only the
+# colour keys; the rest are inherited from "midnight").
+_AMOLED = {"bg": "#000000", "panel": "#080808", "dock": "#000000",
+           "win_bg": "#000000", "win_title": "#080808", "border": "#1a1a1a",
+           "_grid": "#0a0a0a", "_mark": "#141414"}
+_HICON = {"bg": "#000000", "panel": "#0a0a0a", "dock": "#000000",
+          "win_bg": "#000000", "win_title": "#0a0a0a", "border": "#ffffff",
+          "text": "#ffffff", "dim": "#d8d8d8", "accent": "#ffd400",
+          "accent2": "#ffe873"}
+_LIGHT = {"bg": "#eef1f6", "panel": "#ffffff", "dock": "#e2e6ee",
+          "win_bg": "#f5f7fb", "win_title": "#ffffff", "border": "#c8cfdb",
+          "text": "#141a26", "dim": "#5b6472", "accent": "#2f6bff",
+          "accent2": "#6f9bff", "white": "#111111"}
+
+SPEC = [
+  ("Theme", [("theme",),
+             ("choice", "appearance_mode", "Mode", ["Dark", "Light", "Auto"]),
+             ("toggle", "high_contrast", "High contrast", False),
+             ("toggle", "amoled", "AMOLED black", False)]),
+  ("Accent Color", [("swatch", "accent", "Accent colour", _ACCENTS),
+                    ("toggle", "gradient_accent", "Gradient accent", False)]),
+  ("Desktop", [("wallpaper",),
+               ("showicons",),
+               ("arrangeicons",),
+               ("slider", "wallpaper_brightness", "Wallpaper brightness", 20, 100, 100),
+               ("toggle", "blur_wallpaper", "Blur wallpaper", False),
+               ("toggle", "slideshow", "Slideshow", False)]),
+  ("Dock", [("slider", "dock_size", "Size", 32, 96, 56),
+            ("toggle", "dock_autohide", "Auto-hide", False),
+            ("toggle", "dock_autohide_animated", "Auto-hide — animated slide", False),
+            ("toggle", "dock_magnify", "Magnification", False),
+            ("toggle", "dock_float", "Floating dock", False),
+            ("slider", "dock_opacity", "Opacity", 20, 100, 90)]),
+  ("Windows", [("slider", "win_radius", "Corner radius", 0, 24, 14),
+               ("toggle", "win_shadows", "Window shadows", True),
+               ("slider", "win_opacity", "Transparency", 60, 100, 100),
+               ("toggle", "win_snap", "Snap assist", True)]),
+  ("Menu Bar", [("toggle", "mb_autohide", "Auto-hide", False),
+                ("toggle", "mb_battery", "Battery icon", True),
+                ("toggle", "mb_network", "Network icon", True),
+                ("toggle", "mb_volume", "Volume icon", True),
+                ("toggle", "mb_cpu", "CPU monitor", False),
+                ("toggle", "mb_gpu", "GPU monitor", False),
+                ("toggle", "mb_ram", "RAM monitor", False)]),
+  ("Icons", [("animated",),
+             ("slider", "icon_size", "Icon size", 90, 200, 150),
+             ("toggle", "icon_labels", "Icon labels", True)]),
+  ("Cursor", [("choice", "cursor_theme", "Template", ["Default", "Neon", "Ink"]),
+              ("slider", "cursor_size", "Size", 16, 64, 24),
+              ("toggle", "cursor_trail", "Pointer trail", False),
+              ("cursorai",),
+              ("slider", "cursor_trail_speed", "Trail — emitter speed", 10, 100, 60),
+              ("slider", "cursor_trail_amount", "Trail — particle amount", 10, 200, 70),
+              ("slider", "cursor_trail_size", "Trail — particle size", 4, 40, 10),
+              ("slider", "cursor_trail_life", "Trail — particle lifetime", 10, 100, 40),
+              ("slider", "cursor_trail_spread", "Trail — expand / flocking", 0, 100, 0),
+              ("slider", "cursor_trail_noise", "Trail — random / wave noise", 0, 100, 0),
+              ("choice", "cursor_trail_palette", "Trail colours",
+               ["Auto (AI)", "Custom", "Black", "White", "RGBY", "Pastel"]),
+              ("cursorpal",),
+              ("toggle", "cursor_click_anim", "Click animation", False)]),
+  ("Fonts", [("slider", "font_size", "Font size", 8, 18, 10),
+             ("slider", "ui_scale", "UI scale (%)", 80, 150, 100),
+             ("toggle", "bold_ui", "Bold interface", False)]),
+  ("Effects", [("slider", "blur_amount", "Blur amount", 0, 40, 22),
+               ("toggle", "acrylic", "Acrylic", True),
+               ("toggle", "frosted", "Frosted glass", True),
+               ("toggle", "reduce_transparency", "Reduce transparency", False)]),
+  ("Animation", [("toggle", "anim_window", "Window animation", True),
+                 ("toggle", "anim_open", "Open animation", True),
+                 ("slider", "anim_speed", "Speed (%)", 25, 200, 100),
+                 ("toggle", "anim_disable", "Disable animations", False)]),
+  ("Accessibility", [("toggle", "a_high_contrast", "High contrast", False),
+                     ("toggle", "a_grayscale", "Grayscale", False),
+                     ("toggle", "a_night", "Night mode", False),
+                     ("toggle", "a_large_cursor", "Large cursor", False),
+                     ("toggle", "a_reduce_motion", "Reduced motion", False)]),
+  ("Display", [("slider", "brightness", "Brightness", 10, 100, 100),
+               ("toggle", "night_shift", "Night shift", False),
+               ("toggle", "blue_light", "Blue light filter", False)]),
+  ("Lock Screen", [("toggle", "lock_blur", "Blur", True),
+                   ("toggle", "lock_weather", "Weather", False),
+                   ("toggle", "lock_music", "Music controls", True)]),
+  ("Login Screen", [("toggle", "login_blur", "Blur", True),
+                    ("toggle", "login_welcome", "Welcome animation", True)]),
+  ("Sound", [("choice", "vol_osd", "Volume OSD style", ["Slider", "Bar", "Ring"]),
+             ("toggle", "sound_viz", "Sound visualizer", False)]),
+  ("Notifications", [("choice", "notif_pos", "Position",
+                      ["Top-right", "Top-left", "Bottom-right"]),
+                     ("toggle", "notif_group", "Grouping", True),
+                     ("slider", "notif_opacity", "Transparency", 40, 100, 95)]),
+  ("Widgets", [("slider", "widget_opacity", "Transparency", 40, 100, 90),
+               ("toggle", "widget_interactive", "Interactive widgets", True)]),
+  ("Advanced", [("iconmgr",),
+                ("folder",),
+                ("note", "Prefs are saved in ~/.config/luci/appearance.json")]),
+]
+
+
+def _lbl(t, c="#9fb2d8", sz=9, bold=False):
+    l = QLabel(t)
+    l.setWordWrap(True)                 # never let a long label widen the window
+    l.setStyleSheet("color:%s;background:transparent;border:none;" % c)
+    l.setFont(QFont("Segoe UI", sz, QFont.Bold if bold else QFont.Normal))
+    return l
+
+
+class Appearance(LuciWindow):
+    TITLE = "Appearance"
+    ICON  = "🎨"
+    SIZE  = (820, 620)
+
+    def build_body(self, layout):
+        self._prefs = _load()
+        self._status = _lbl("", "#8ca2c8", 8)
+        # Ignored horizontal policy → this status label never imposes its
+        # width on the window (it sits outside a scroll area).
+        self._status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        # Hard width cap so no child's size hint can blow the window wide.
+        self.setMinimumWidth(680)
+        self.setMaximumWidth(900)
+
+        row = QHBoxLayout(); row.setSpacing(0); layout.addLayout(row, 1)
+
+        # ── sidebar ────────────────────────────────────────────────────
+        self._side = QListWidget()
+        self._side.setFixedWidth(190)
+        self._side.setStyleSheet(
+            "QListWidget{background:rgba(12,18,34,120);border:none;"
+            "border-right:1px solid rgba(255,255,255,15);color:#ccd8f0;"
+            "outline:none;padding:6px;}"
+            "QListWidget::item{padding:8px 12px;border-radius:8px;margin:1px 2px;}"
+            "QListWidget::item:selected{background:rgba(76,141,255,150);color:white;}"
+            "QListWidget::item:hover{background:rgba(255,255,255,14);}")
+        row.addWidget(self._side)
+
+        self._stack = QStackedWidget()
+        row.addWidget(self._stack, 1)
+
+        for name, controls in SPEC:
+            QListWidgetItem(name, self._side)
+            self._stack.addWidget(self._make_panel(name, controls))
+        self._side.currentRowChanged.connect(self._stack.setCurrentIndex)
+        self._side.setCurrentRow(0)
+
+        layout.addWidget(self._status)
+
+    # ── panel + controls ───────────────────────────────────────────────
+    def _make_panel(self, name, controls):
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            "QScrollArea{background:transparent;}"
+            "QScrollBar:vertical{background:transparent;width:8px;}"
+            "QScrollBar::handle:vertical{background:rgba(120,160,220,90);"
+            "border-radius:4px;min-height:24px;}"
+            "QScrollBar::add-line,QScrollBar::sub-line{height:0;}")
+        inner = QWidget(); inner.setStyleSheet("background:transparent;")
+        col = QVBoxLayout(inner); col.setContentsMargins(22, 18, 22, 18); col.setSpacing(12)
+        col.addWidget(_lbl(name, "#eaf2ff", 15, True))
+        for c in controls:
+            try:
+                self._add_control(col, c)
+            except Exception:
+                pass
+        col.addStretch(1)
+        scroll.setWidget(inner)
+        return scroll
+
+    def _row(self, col, label_widget, ctrl):
+        r = QHBoxLayout(); r.addWidget(label_widget); r.addStretch(1); r.addWidget(ctrl)
+        col.addLayout(r)
+
+    def _add_control(self, col, c):
+        kind = c[0]
+        if kind == "theme":
+            return self._c_theme(col)
+        if kind == "wallpaper":
+            return self._c_wallpaper(col)
+        if kind == "showicons":
+            cb = QCheckBox("Show desktop icons")
+            try:
+                cb.setChecked(bool(self._desk and self._desk._desktop_icons_shown()))
+            except Exception:
+                cb.setChecked(True)
+            cb.setStyleSheet(
+                "QCheckBox{color:#eaf2ff;background:transparent;spacing:8px;}"
+                "QCheckBox::indicator{width:18px;height:18px;border-radius:5px;"
+                "border:1px solid rgba(255,255,255,70);background:rgba(255,255,255,15);}"
+                "QCheckBox::indicator:checked{background:#4c8dff;border:none;}")
+            def _ti(_s):
+                try:
+                    if self._desk and self._desk._desktop_icons_shown() != cb.isChecked():
+                        self._desk.toggle_desktop_icons()
+                except Exception:
+                    pass
+                self._status.setText("Desktop icons %s." %
+                                     ("shown" if cb.isChecked() else "hidden"))
+            cb.stateChanged.connect(_ti)
+            col.addWidget(cb)
+            col.addWidget(_lbl("Show or hide the files/folders on your desktop.",
+                               "#8ca2c8", 8))
+            return
+        if kind == "arrangeicons":
+            b = QPushButton("🧹  Arrange desktop icons  (snap to grid)")
+            b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(
+                "QPushButton{background:rgba(48,70,110,120);color:#dce8f8;border:1px "
+                "solid rgba(120,160,220,90);border-radius:9px;padding:9px 14px;}"
+                "QPushButton:hover{background:rgba(70,100,150,150);}")
+            def _ar():
+                try:
+                    if self._desk and hasattr(self._desk, "_arrange_desktop_icons"):
+                        self._desk._arrange_desktop_icons()
+                        self._status.setText("Desktop icons arranged.")
+                except Exception:
+                    pass
+            b.clicked.connect(_ar)
+            col.addWidget(b)
+            return
+        if kind == "animated":
+            return self._c_animated(col)
+        if kind == "cursorai":
+            return self._c_cursorai(col)
+        if kind == "cursorpal":
+            return self._c_cursorpal(col)
+        if kind == "iconmgr":
+            return self._c_iconmgr(col)
+        if kind == "folder":
+            return self._c_folder(col)
+        if kind == "note":
+            col.addWidget(_lbl(c[1], "#8ca2c8", 8)); return
+        if kind == "toggle":
+            _, key, label, default = c
+            cb = QCheckBox(label)
+            cb.setChecked(bool(self._prefs.get(key, default)))
+            cb.setStyleSheet(
+                "QCheckBox{color:#eaf2ff;background:transparent;spacing:8px;}"
+                "QCheckBox::indicator{width:18px;height:18px;border-radius:5px;"
+                "border:1px solid rgba(255,255,255,70);background:rgba(255,255,255,15);}"
+                "QCheckBox::indicator:checked{background:#4c8dff;border:none;}")
+            cb.stateChanged.connect(lambda _s, k=key, w=cb: self._toggle(k, w.isChecked()))
+            col.addWidget(cb)
+        elif kind == "slider":
+            _, key, label, mn, mx, default = c
+            s = QSlider(Qt.Horizontal); s.setMinimum(mn); s.setMaximum(mx)
+            s.setValue(int(self._prefs.get(key, default)))
+            s.setFixedWidth(240); s.setFixedHeight(30)
+            s.setCursor(Qt.PointingHandCursor)
+            # Big, grabbable handle — the thin default was "mahirap gamitin".
+            s.setStyleSheet(
+                "QSlider{height:30px;}"
+                "QSlider::groove:horizontal{height:8px;background:rgba(255,255,255,28);border-radius:4px;}"
+                "QSlider::sub-page:horizontal{background:#4c8dff;border-radius:4px;}"
+                "QSlider::add-page:horizontal{background:rgba(255,255,255,18);border-radius:4px;}"
+                "QSlider::handle:horizontal{background:white;width:24px;height:24px;"
+                "margin:-9px 0;border-radius:12px;border:2px solid #4c8dff;}"
+                "QSlider::handle:horizontal:hover{background:#dbe8ff;}")
+            val = _lbl(str(s.value()), "#cfe0ff", 9)
+            s.valueChanged.connect(lambda v, k=key, w=val: (w.setText(str(v)), self._put(k, v)))
+            box = QHBoxLayout(); box.addWidget(s); box.addWidget(val)
+            wrap = QWidget(); wrap.setLayout(box)
+            self._row(col, _lbl(label), wrap)
+        elif kind == "choice":
+            _, key, label, opts = c
+            cb = QComboBox(); cb.addItems(opts)
+            cur = self._prefs.get(key)
+            if cur in opts: cb.setCurrentText(cur)
+            cb.setStyleSheet(
+                "QComboBox{background:rgba(255,255,255,14);color:#eaf2ff;"
+                "border:1px solid rgba(255,255,255,40);border-radius:7px;padding:5px 9px;min-width:130px;}")
+            cb.currentTextChanged.connect(lambda t, k=key: self._choice(k, t))
+            self._row(col, _lbl(label), cb)
+        elif kind == "swatch":
+            _, key, label, opts = c
+            col.addWidget(_lbl(label))
+            roww = QHBoxLayout()
+            cur = self._prefs.get(key)
+            for nm, hexv in opts:
+                b = QPushButton(); b.setFixedSize(30, 30); b.setCursor(Qt.PointingHandCursor)
+                sel = "border:2px solid white;" if cur == hexv else "border:1px solid rgba(255,255,255,40);"
+                b.setStyleSheet("QPushButton{background:%s;border-radius:15px;%s}" % (hexv, sel))
+                b.setToolTip(nm)
+                b.clicked.connect(lambda _c, k=key, h=hexv: self._pick_swatch(k, h))
+                roww.addWidget(b)
+            roww.addStretch(1)
+            w = QWidget(); w.setLayout(roww); col.addWidget(w)
+
+    # ── live theme helpers ─────────────────────────────────────────────
+    def _set_theme(self, name):
+        try:
+            if self._desk and hasattr(self._desk, "set_theme_live"):
+                self._desk.set_theme_live(name)
+        except Exception:
+            pass
+
+    def _apply_palette(self, name, overrides):
+        """Register a palette (base = midnight + overrides) and apply it live."""
+        try:
+            base = dict(THEMES.get("midnight", {}) or {})
+            base.update(overrides)
+            THEMES[name] = base
+            self._set_theme(name)
+            self._status.setText("✓ %s applied live." % name)
+        except Exception as ex:
+            self._status.setText("apply failed: %s" % ex)
+
+    def _toggle(self, key, on):
+        self._put(key, on)
+        if key == "amoled":
+            self._apply_palette("amoled", _AMOLED) if on else self._set_theme("midnight")
+        elif key == "high_contrast":
+            self._apply_palette("hicon", _HICON) if on else self._set_theme("midnight")
+
+    def _choice(self, key, val):
+        self._put(key, val)
+        if key == "appearance_mode":
+            if val == "Light":
+                self._apply_palette("light", _LIGHT)
+            elif val == "Auto":
+                import datetime
+                h = datetime.datetime.now().hour
+                (self._apply_palette("light", _LIGHT) if 7 <= h < 19
+                 else self._set_theme("midnight"))
+            else:  # Dark
+                self._set_theme("midnight")
+
+    # ── persistence ────────────────────────────────────────────────────
+    def _put(self, key, value):
+        self._prefs[key] = value
+        try:
+            os.makedirs(os.path.dirname(PREFS), exist_ok=True)
+            with open(PREFS, "w", encoding="utf-8") as f:
+                json.dump(self._prefs, f, indent=2)
+        except Exception:
+            pass
+        # Live-apply wallpaper brightness / blur / slideshow.
+        if key in ("wallpaper_brightness", "blur_wallpaper", "slideshow"):
+            try:
+                wp = getattr(self._desk, "_wallpaper", None)
+                if wp is not None and hasattr(wp, "refresh_wallpaper_settings"):
+                    wp.refresh_wallpaper_settings()
+            except Exception:
+                pass
+        # Live-apply ALL dock settings (size / opacity / magnify / autohide /
+        # float) the instant any Dock control changes — no restart.
+        if key.startswith("dock_"):
+            try:
+                if self._desk and hasattr(self._desk, "apply_dock_settings"):
+                    self._desk.apply_dock_settings()
+            except Exception:
+                pass
+        # Live-apply cursor settings (size / template / trail).
+        if key.startswith("cursor_"):
+            try:
+                if self._desk and hasattr(self._desk, "apply_cursor_settings"):
+                    self._desk.apply_cursor_settings()
+            except Exception:
+                pass
+        # Live-apply menu-bar settings (tray items / monitors / auto-hide).
+        if key.startswith("mb_"):
+            try:
+                if self._desk and hasattr(self._desk, "apply_menubar_settings"):
+                    self._desk.apply_menubar_settings()
+            except Exception:
+                pass
+
+    # ── live controls ──────────────────────────────────────────────────
+    def _c_theme(self, col):
+        col.addWidget(_lbl("Theme — click to apply instantly (live preview)"))
+        from PyQt5.QtWidgets import QGridLayout
+        grid = QGridLayout(); grid.setSpacing(8)
+        names = list(THEMES.keys()) if THEMES else ["midnight"]
+        for i, n in enumerate(names):
+            t = THEMES.get(n, {}) or {}
+            acc = t.get("accent", "#4c8dff")
+            bg = t.get("bg", t.get("panel", "#0b0e17"))
+            chip = QPushButton("  " + n.capitalize())
+            chip.setCursor(Qt.PointingHandCursor)
+            chip.setFixedHeight(48)
+            chip.setStyleSheet(
+                "QPushButton{text-align:left;color:#eaf2ff;background:%s;"
+                "border:2px solid %s;border-radius:10px;padding:6px 12px;font-weight:600;}"
+                "QPushButton:hover{border:2px solid white;}" % (bg, acc))
+            chip.clicked.connect(lambda _c, nm=n: self._pick_theme(nm))
+            grid.addWidget(chip, i // 3, i % 3)
+        w = QWidget(); w.setLayout(grid); col.addWidget(w)
+
+        # Turn particles off (keeps the current colours; particles from AI
+        # Themes layer on top of normal themes until you switch them off).
+        pb = QPushButton("🌟  Turn off particles")
+        pb.setCursor(Qt.PointingHandCursor)
+        pb.setStyleSheet(
+            "QPushButton{background:rgba(48,70,110,120);color:#dce8f8;border:1px "
+            "solid rgba(120,160,220,90);border-radius:9px;padding:8px 14px;}"
+            "QPushButton:hover{background:rgba(70,100,150,150);}")
+        pb.clicked.connect(self._particles_off)
+        col.addWidget(pb)
+
+    def _particles_off(self):
+        ok = False
+        try:
+            if self._desk and hasattr(self._desk, "particles_off"):
+                ok = self._desk.particles_off()
+        except Exception:
+            ok = False
+        self._status.setText("✓ Particles off." if ok else "particles off failed")
+
+    def _pick_theme(self, n):
+        ok = False
+        try:
+            if self._desk and hasattr(self._desk, "set_theme_live"):
+                ok = self._desk.set_theme_live(n)
+        except Exception:
+            ok = False
+        self._status.setText(("✓ Theme '%s' applied live." % n) if ok
+                             else "theme apply failed")
+
+    def _pick_swatch(self, key, hexv):
+        self._put(key, hexv)
+        if key == "accent":
+            try:
+                if self._desk and hasattr(self._desk, "set_accent_live"):
+                    self._desk.set_accent_live(hexv)
+                self._status.setText("✓ Accent applied live: " + hexv)
+                return
+            except Exception:
+                pass
+        self._status.setText("Saved: " + hexv)
+
+    def _c_wallpaper(self, col):
+        b = QPushButton("🖼  Choose wallpaper  (image or animated GIF)…")
+        b.setCursor(Qt.PointingHandCursor)
+        b.setStyleSheet(
+            "QPushButton{background:rgba(76,141,255,120);color:white;border:none;"
+            "border-radius:9px;padding:9px 16px;font-weight:600;}"
+            "QPushButton:hover{background:rgba(76,141,255,170);}")
+        def _pick():
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Choose wallpaper (image or animated GIF)",
+                os.path.expanduser("~"),
+                "Wallpaper (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.mng)")
+            if not path:
+                return
+            try:
+                wp = getattr(self._desk, "_wallpaper", None)
+                if wp is not None and hasattr(wp, "set_user_wallpaper"):
+                    wp.set_user_wallpaper(path)
+                    self._status.setText("Wallpaper set (live).")
+                else:
+                    self._status.setText("wallpaper engine not available.")
+            except Exception as ex:
+                self._status.setText("wallpaper error: %s" % ex)
+        b.clicked.connect(_pick)
+        col.addWidget(b)
+
+    def _c_animated(self, col):
+        cb = QCheckBox("Animated icons")
+        cb.setChecked(bool(self._prefs.get("animated_icons", False)))
+        cb.setStyleSheet(
+            "QCheckBox{color:#eaf2ff;background:transparent;spacing:8px;}"
+            "QCheckBox::indicator{width:18px;height:18px;border-radius:5px;"
+            "border:1px solid rgba(255,255,255,70);background:rgba(255,255,255,15);}"
+            "QCheckBox::indicator:checked{background:#4c8dff;border:none;}")
+        def _t(_s):
+            self._put("animated_icons", cb.isChecked())
+            # Realtime: refresh the dock icons instantly (the Launchpad
+            # re-scans on its next open).
+            live = False
+            try:
+                if self._desk and hasattr(self._desk, "refresh_dock_icons"):
+                    self._desk.refresh_dock_icons()
+                    live = True
+            except Exception:
+                live = False
+            self._status.setText(
+                "Animated icons %s%s" %
+                ("ON" if cb.isChecked() else "OFF",
+                 " — applied live." if live else " — reopen the Launchpad."))
+        cb.stateChanged.connect(_t)
+        col.addWidget(cb)
+        col.addWidget(_lbl("Plays <appkey>.gif or .webp from the icon folder "
+                           "(Advanced) instead of the static icon.", "#8ca2c8", 8))
+
+    def _c_cursorai(self, col):
+        from PyQt5.QtWidgets import QLineEdit
+        col.addWidget(_lbl("✨ Cursor-AI — describe a vibe, the trail adapts "
+                           "(like AI Themes, but for your cursor):",
+                           "#cbd9f2", 9))
+        row = QHBoxLayout()
+        box = QLineEdit()
+        box.setText(str(self._prefs.get("cursor_ai", "")))
+        box.setPlaceholderText("e.g. fire, ocean, galaxy, love, neon…")
+        box.setStyleSheet(
+            "QLineEdit{background:rgba(255,255,255,14);color:#eaf2ff;"
+            "border:1px solid rgba(255,255,255,40);border-radius:8px;"
+            "padding:7px 10px;}")
+        btn = QPushButton("Apply ✨")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setStyleSheet(
+            "QPushButton{background:rgba(94,200,255,40);color:#fff;"
+            "border:1px solid rgba(94,200,255,140);border-radius:8px;"
+            "padding:7px 16px;}"
+            "QPushButton:hover{background:rgba(94,200,255,80);}")
+
+        def _apply():
+            prompt = box.text().strip()
+            self._put("cursor_ai", prompt)          # persists + triggers hook
+            # also turn the trail ON so the effect shows immediately
+            if not self._prefs.get("cursor_trail"):
+                self._put("cursor_trail", True)
+            ok = False
+            try:
+                if self._desk and hasattr(self._desk, "set_cursor_ai"):
+                    ok = self._desk.set_cursor_ai(prompt)
+            except Exception:
+                ok = False
+            self._status.setText("Cursor-AI: “%s” applied." % prompt
+                                 if ok else "Cursor-AI set.")
+        btn.clicked.connect(_apply)
+        box.returnPressed.connect(_apply)
+        row.addWidget(box); row.addWidget(btn)
+        wrap = QWidget(); wrap.setLayout(row)
+        col.addWidget(wrap)
+
+    # ── Icon Manager (Advanced) ──────────────────────────────────────────
+    _IM_HISTORY = os.path.join(APPICONS, ".history")
+    _IM_EXTS = (".webp", ".gif", ".png")
+
+    def _scan_apps_for_icons(self):
+        """(name, key) for every .vx app — key is the filename stem, the
+        SAME key the dock/launchpad use for appicons/<key>.<ext>."""
+        out, seen = [], set()
+        dirs = [os.path.dirname(os.path.abspath(__file__)),
+                os.path.join(os.path.expanduser("~"), ".config", "luci", "apps")]
+        for d in dirs:
+            try:
+                names = sorted(os.listdir(d))
+            except Exception:
+                continue
+            for f in names:
+                if not f.endswith(".vx"):
+                    continue
+                key = f[:-3].lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                nm = f[:-3]
+                try:
+                    with open(os.path.join(d, f), encoding="utf-8",
+                              errors="ignore") as fh:
+                        for _ in range(8):
+                            ln = fh.readline()
+                            if ln.startswith("# VX:name="):
+                                nm = ln.split("=", 1)[1].strip(); break
+                            if not ln.startswith("# VX:") and ln.strip():
+                                break
+                except Exception:
+                    pass
+                out.append((nm, key))
+        out.sort(key=lambda t: t[0].lower())
+        return out
+
+    def _im_key(self):
+        try:
+            return self._im_combo.currentData()
+        except Exception:
+            return None
+
+    def _im_history_files(self, key):
+        """Active icon(s) + past uploads for `key`, newest first."""
+        import glob
+        items = []
+        for ext in self._IM_EXTS:
+            ap = os.path.join(APPICONS, key + ext)
+            if os.path.isfile(ap):
+                items.append((ap, True))
+        hist = sorted(glob.glob(os.path.join(self._IM_HISTORY, key + "__*")),
+                      reverse=True)
+        for h in hist:
+            items.append((h, False))
+        return items
+
+    def _c_iconmgr(self, col):
+        from PyQt5.QtWidgets import QComboBox
+        col.addWidget(_lbl("🎨 App Icons — give any app a custom or ANIMATED "
+                           "icon (PNG / GIF / WebP).", "#cbd9f2", 10, True))
+        col.addWidget(_lbl("Choose an app:"))
+        self._im_combo = QComboBox()
+        self._im_combo.setEditable(True)                 # type to search
+        self._im_combo.setInsertPolicy(QComboBox.NoInsert)
+        self._im_combo.setStyleSheet(
+            "QComboBox{background:rgba(255,255,255,14);color:#eaf2ff;"
+            "border:1px solid rgba(255,255,255,40);border-radius:8px;"
+            "padding:6px 10px;min-width:240px;}")
+        for nm, key in self._scan_apps_for_icons():
+            self._im_combo.addItem("%s   (%s)" % (nm, key), key)
+        self._im_combo.currentIndexChanged.connect(lambda _i: self._im_reload())
+        col.addWidget(self._im_combo)
+
+        up = QPushButton("⬆  Upload icon for this app…")
+        up.setCursor(Qt.PointingHandCursor)
+        up.setStyleSheet(
+            "QPushButton{background:rgba(94,200,255,40);color:#fff;"
+            "border:1px solid rgba(94,200,255,140);border-radius:9px;"
+            "padding:9px 16px;}"
+            "QPushButton:hover{background:rgba(94,200,255,80);}")
+        up.clicked.connect(self._im_upload)
+        col.addWidget(up)
+
+        col.addWidget(_lbl("Uploaded icons — the top one is active; click ✕ to "
+                           "send an old one to Trash:", "#8ca2c8", 8))
+        self._im_list = QVBoxLayout(); self._im_list.setSpacing(6)
+        holder = QWidget(); holder.setLayout(self._im_list)
+        col.addWidget(holder)
+        self._im_reload()
+
+    def _im_thumb(self, path):
+        from PyQt5.QtGui import QPixmap
+        lbl = QLabel()
+        lbl.setFixedSize(40, 40)
+        lbl.setStyleSheet("background:rgba(255,255,255,10);border-radius:8px;")
+        lbl.setAlignment(Qt.AlignCenter)
+        try:
+            pm = QPixmap(path)                 # first frame for gif/webp
+            if not pm.isNull():
+                lbl.setPixmap(pm.scaled(36, 36, Qt.KeepAspectRatio,
+                                        Qt.SmoothTransformation))
+        except Exception:
+            pass
+        return lbl
+
+    def _im_reload(self):
+        lay = getattr(self, "_im_list", None)
+        if lay is None:
+            return
+        while lay.count():
+            it = lay.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        key = self._im_key()
+        if not key:
+            return
+        files = self._im_history_files(key)
+        if not files:
+            lay.addWidget(_lbl("No custom icon yet — click Upload above.",
+                               "#7d99c4", 8))
+            return
+        for path, active in files:
+            row = QHBoxLayout(); row.setSpacing(8)
+            row.addWidget(self._im_thumb(path))
+            tag = "  ● active" if active else ""
+            nm = _lbl(os.path.basename(path) + tag,
+                      "#dce8f8" if active else "#9fb2d8", 8)
+            row.addWidget(nm, 1)
+            x = QPushButton("✕"); x.setFixedSize(26, 26)
+            x.setCursor(Qt.PointingHandCursor)
+            x.setToolTip("Send to Trash")
+            x.setStyleSheet(
+                "QPushButton{background:rgba(255,95,95,45);color:#fff;"
+                "border:1px solid rgba(255,95,95,120);border-radius:13px;}"
+                "QPushButton:hover{background:rgba(255,95,95,110);}")
+            x.clicked.connect(lambda _c, p=path: self._im_remove(p))
+            row.addWidget(x)
+            w = QWidget(); w.setLayout(row); lay.addWidget(w)
+
+    def _im_upload(self):
+        import shutil, time
+        key = self._im_key()
+        if not key:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose an icon for %s" % key, os.path.expanduser("~"),
+            "Images (*.png *.gif *.webp)")
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in self._IM_EXTS:
+            self._status.setText("Use a PNG, GIF or WebP file."); return
+        try:
+            os.makedirs(APPICONS, exist_ok=True)
+            os.makedirs(self._IM_HISTORY, exist_ok=True)
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            # Archive the CURRENT active icons to history first.
+            for e in self._IM_EXTS:
+                cur = os.path.join(APPICONS, key + e)
+                if os.path.isfile(cur):
+                    shutil.move(cur, os.path.join(
+                        self._IM_HISTORY, "%s__%s-old%s" % (key, ts, e)))
+            # Keep a history copy of the new upload + set it active.
+            shutil.copy2(path, os.path.join(
+                self._IM_HISTORY, "%s__%s%s" % (key, ts, ext)))
+            shutil.copy2(path, os.path.join(APPICONS, key + ext))
+            self._status.setText("Icon set for %s. Animated icons must be ON "
+                                 "to play GIF/WebP." % key)
+            self._im_reload()
+            self._im_refresh_system()
+        except Exception as ex:
+            self._status.setText("Upload failed: %s" % ex)
+
+    def _im_remove(self, path):
+        import shutil, time
+        try:
+            trash = getattr(self._desk, "_trash_dir", None) if self._desk else None
+            base = os.path.basename(path)
+            if trash and os.path.isdir(os.path.dirname(trash) or "/"):
+                os.makedirs(trash, exist_ok=True)
+                dest = os.path.join(trash, base)
+                if os.path.exists(dest):
+                    dest = os.path.join(trash, "%s-%s" % (
+                        time.strftime("%H%M%S"), base))
+                shutil.move(path, dest)
+                self._status.setText("Moved to Trash: " + base)
+            else:
+                os.remove(path)
+                self._status.setText("Deleted: " + base)
+            self._im_reload()
+            self._im_refresh_system()
+        except Exception as ex:
+            self._status.setText("Remove failed: %s" % ex)
+
+    def _im_refresh_system(self):
+        try:
+            if self._desk and hasattr(self._desk, "refresh_dock_icons"):
+                self._desk.refresh_dock_icons()
+        except Exception:
+            pass
+
+    def _c_cursorpal(self, col):
+        from PyQt5.QtWidgets import QColorDialog
+        col.addWidget(_lbl("🎨 Custom trail colours — click a slot to pick "
+                           "(the picker has an eyedropper). Use 1, 2 or 3:",
+                           "#cbd9f2", 9))
+        self._pal_colors = [c for c in
+                            list(self._prefs.get("cursor_trail_colors", []))
+                            if c][:3]
+        self._pal_btns = []
+        row = QHBoxLayout(); row.setSpacing(8)
+
+        def _refresh(i, b):
+            c = self._pal_colors[i] if i < len(self._pal_colors) else ""
+            if c:
+                b.setText("")
+                b.setStyleSheet("QPushButton{background:%s;border:2px solid "
+                                "rgba(255,255,255,120);border-radius:9px;}" % c)
+            else:
+                b.setText("＋")
+                b.setStyleSheet("QPushButton{background:rgba(255,255,255,10);"
+                                "color:#9fb2d8;border:1px dashed "
+                                "rgba(255,255,255,60);border-radius:9px;"
+                                "font-size:16px;}")
+
+        def _mk(i):
+            b = QPushButton()
+            b.setFixedSize(52, 36); b.setCursor(Qt.PointingHandCursor)
+
+            def _pick():
+                cur = (self._pal_colors[i]
+                       if i < len(self._pal_colors) else "") or "#4c8dff"
+                c = QColorDialog.getColor(QColor(cur), self,
+                                          "Pick colour %d" % (i + 1))
+                if c.isValid():
+                    while len(self._pal_colors) <= i:
+                        self._pal_colors.append("")
+                    self._pal_colors[i] = c.name()
+                    _refresh(i, b); self._commit_pal()
+            b.clicked.connect(_pick)
+            _refresh(i, b)
+            self._pal_btns.append((i, b))
+            return b
+
+        for i in range(3):
+            row.addWidget(_mk(i))
+        clr = QPushButton("Clear")
+        clr.setCursor(Qt.PointingHandCursor)
+        clr.setStyleSheet(
+            "QPushButton{background:rgba(255,255,255,12);color:#cbd9f2;"
+            "border:1px solid rgba(255,255,255,40);border-radius:8px;"
+            "padding:6px 12px;}")
+        clr.clicked.connect(self._clear_pal)
+        row.addWidget(clr); row.addStretch(1)
+        w = QWidget(); w.setLayout(row); col.addWidget(w)
+
+    def _commit_pal(self):
+        cols = [c for c in getattr(self, "_pal_colors", []) if c]
+        self._put("cursor_trail_colors", cols)
+        # Picking colours switches the palette to Custom automatically.
+        self._put("cursor_trail_palette", "Custom" if cols else "Auto (AI)")
+        self._status.setText("Trail colours: %d picked." % len(cols))
+
+    def _clear_pal(self):
+        self._pal_colors = []
+        for i, b in getattr(self, "_pal_btns", []):
+            b.setText("＋")
+            b.setStyleSheet("QPushButton{background:rgba(255,255,255,10);"
+                            "color:#9fb2d8;border:1px dashed "
+                            "rgba(255,255,255,60);border-radius:9px;"
+                            "font-size:16px;}")
+        self._commit_pal()
+
+    def _c_folder(self, col):
+        col.addWidget(_lbl("Custom & animated icons folder:"))
+        pathl = _lbl(APPICONS, "#cfe0ff", 8)
+        pathl.setStyleSheet("color:#cfe0ff;background:rgba(255,255,255,10);"
+                            "border:1px solid rgba(255,255,255,30);border-radius:7px;padding:6px 9px;")
+        pathl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        col.addWidget(pathl)
+        r = QHBoxLayout()
+        bo = QPushButton("📂  Open icon folder"); bc = QPushButton("📋  Copy path")
+        for b in (bo, bc):
+            b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(
+                "QPushButton{background:rgba(48,70,110,120);color:#dce8f8;"
+                "border:1px solid rgba(120,160,220,90);border-radius:9px;padding:8px 14px;}"
+                "QPushButton:hover{background:rgba(70,100,150,150);}")
+        bo.clicked.connect(self._open_icons_folder)
+        bc.clicked.connect(self._copy_path)
+        r.addWidget(bo); r.addWidget(bc); r.addStretch(1)
+        w = QWidget(); w.setLayout(r); col.addWidget(w)
+        col.addWidget(_lbl("Drop <appkey>.png (static) or <appkey>.gif/.webp "
+                           "(animated) here — e.g. vinx.gif.", "#8ca2c8", 8))
+
+    def _open_icons_folder(self):
+        os.makedirs(APPICONS, exist_ok=True)
+        try:
+            from luci import FileManager
+            FileManager(self._desk, APPICONS)
+        except Exception:
+            self._copy_path()
+
+    def _copy_path(self):
+        try:
+            QApplication.clipboard().setText(APPICONS)
+            self._status.setText("Copied: " + APPICONS)
+        except Exception:
+            self._status.setText(APPICONS)
+
+
+def main(desktop):
+    w = Appearance(desktop); w.show(); return w

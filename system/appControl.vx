@@ -1,0 +1,221 @@
+# VX:name=appControl
+# VX:icon=🎮
+# VX:version=1.0
+# VX:author=Vincent Ilagan
+# VX:sig=ggGuMk8Ylvt+/a85Ee9RMAIQ3TPVD9v3bCMwtoF0HHjzbfEPteujhlNoSiDzLXy5TkD7Kt7uyYX7rm9Ut12+DA==
+
+import tkinter as tk
+from tkinter import ttk
+import threading, os, sys, time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from luci import C, FONT, FONT_BOLD, FONT_SM, lucy_log
+
+_VINX_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, _VINX_DIR)
+try:
+    import vinx_appcontrol as ac
+    _OK = True
+except ImportError:
+    _OK = False
+
+def main(desktop):
+    win = tk.Toplevel(desktop.root)
+    win.overrideredirect(True)
+    win.configure(bg=C["border"])
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    w, h   = 780, 560
+    offset = len(desktop._windows) * 24
+    win.geometry(f"{w}x{h}+{max(0,(sw-w)//2+offset)}+{max(30,(sh-h)//2+offset)}")
+    win.attributes("-topmost", False)
+    win.lift()
+
+    _sel_app = [None]   # selected app name
+
+    # ── Title bar ─────────────────────────────────────────────────────────────
+    # ── Title bar (global Luci chrome) ─────────────────────────────
+    if hasattr(desktop, "apply_chrome"):
+        desktop.apply_chrome(win, title="appControl — VinX App Remote",
+                              icon="🎮", include_body=False)
+    else:
+        bar = tk.Frame(win, bg=C["win_title"], height=32)
+        bar.pack(fill="x"); bar.pack_propagate(False)
+        tk.Label(bar, text="  🎮  appControl — VinX App Remote",
+                 bg=C["win_title"], fg=C["accent2"], font=FONT_BOLD).pack(side="left", fill="y")
+        tk.Button(bar, text="✕", bg=C["win_title"], fg=C["dim"],
+                  activebackground=C["red"], activeforeground="white",
+                  font=FONT_BOLD, relief="flat", bd=0, padx=10,
+                  command=win.destroy).pack(side="right", fill="y")
+        tk.Button(bar, text="─", bg=C["win_title"], fg=C["dim"],
+                  activebackground=C["border"], font=FONT_BOLD,
+                  relief="flat", bd=0, padx=10,
+                  command=win.withdraw).pack(side="right", fill="y")
+        drag = [None]
+        bar.bind("<ButtonPress-1>", lambda e: drag.__setitem__(0, (e.x_root-win.winfo_x(), e.y_root-win.winfo_y())))
+        bar.bind("<B1-Motion>",     lambda e: win.geometry(f"+{e.x_root-drag[0][0]}+{e.y_root-drag[0][1]}") if drag[0] else None)
+
+    # ── Body: left = window list, right = commands ────────────────────────────
+    body = tk.Frame(win, bg=C["win_bg"])
+    body.pack(fill="both", expand=True, padx=1)
+
+    # Left panel — running windows
+    left = tk.Frame(body, bg=C["win_bg"], width=280)
+    left.pack(side="left", fill="y", padx=(4,0), pady=4)
+    left.pack_propagate(False)
+
+    tk.Label(left, text="Running Windows", bg=C["win_bg"], fg=C["dim"],
+             font=FONT_SM).pack(anchor="w", padx=4, pady=(4,2))
+
+    win_lb = tk.Listbox(left, bg="#080f1f", fg=C["text"], font=("Segoe UI", 9),
+                        selectbackground=C["accent"], selectforeground="white",
+                        relief="flat", bd=0, activestyle="none",
+                        highlightthickness=0)
+    win_lb.pack(fill="both", expand=True, padx=2)
+
+    refresh_btn = tk.Button(left, text="↻ Refresh", bg=C["panel"], fg=C["dim"],
+                            font=FONT_SM, relief="flat", bd=0, pady=4,
+                            activebackground=C["border"])
+    refresh_btn.pack(fill="x", padx=2, pady=(2,0))
+
+    # Divider
+    tk.Frame(body, bg=C["border"], width=1).pack(side="left", fill="y")
+
+    # Right panel — commands
+    right = tk.Frame(body, bg=C["win_bg"])
+    right.pack(side="left", fill="both", expand=True, padx=4, pady=4)
+
+    app_title = tk.Label(right, text="← Select a window", bg=C["win_bg"],
+                         fg=C["accent2"], font=FONT_BOLD)
+    app_title.pack(anchor="w", padx=4, pady=(4,2))
+
+    tk.Label(right, text="Preset Commands", bg=C["win_bg"], fg=C["dim"],
+             font=FONT_SM).pack(anchor="w", padx=4)
+
+    # Preset buttons grid
+    preset_frame = tk.Frame(right, bg=C["win_bg"])
+    preset_frame.pack(fill="both", expand=True, padx=2, pady=4)
+
+    # Custom key sender
+    custom_frame = tk.Frame(right, bg=C["panel"], pady=6)
+    custom_frame.pack(fill="x", padx=2, pady=(0,2))
+
+    tk.Label(custom_frame, text="  Send Keys:", bg=C["panel"], fg=C["dim"],
+             font=FONT_SM).pack(side="left")
+
+    key_var = tk.StringVar()
+    key_entry = tk.Entry(custom_frame, textvariable=key_var, bg=C["border"],
+                         fg=C["text"], font=("Consolas", 10),
+                         insertbackground="white", relief="flat", bd=4, width=18)
+    key_entry.pack(side="left", padx=4)
+
+    def _send_custom():
+        raw = key_var.get().strip()
+        if not raw or not _sel_app[0]:
+            return
+        def _work():
+            ok, msg = ac.run_raw_keys(_sel_app[0], raw)
+            win.after(0, lambda: status_var.set(f"  {'✅' if ok else '⚠'}  {msg}"))
+        threading.Thread(target=_work, daemon=True).start()
+
+    key_entry.bind("<Return>", lambda _: _send_custom())
+    tk.Button(custom_frame, text="Send", bg=C["accent"], fg="white",
+              font=FONT_SM, relief="flat", bd=0, padx=10,
+              activebackground=C["accent2"],
+              command=_send_custom).pack(side="left")
+    tk.Label(custom_frame, text="  e.g. ctrl+s  f12  shift+a",
+             bg=C["panel"], fg=C["dim"], font=("Segoe UI", 8)).pack(side="left", padx=6)
+
+    # Status bar
+    status_var = tk.StringVar(value="  Select a window, then pick a command or send keys.")
+    tk.Label(win, textvariable=status_var, bg=C["panel"], fg=C["dim"],
+             font=("Segoe UI", 8), anchor="w").pack(side="bottom", fill="x", padx=1, pady=(0,1))
+
+    # ── Populate preset buttons ───────────────────────────────────────────────
+    _preset_btns = []
+
+    def _load_presets(app_name):
+        for b in _preset_btns:
+            b.destroy()
+        _preset_btns.clear()
+        if not _OK:
+            return
+        norm = ac._normalize_app(app_name)
+        presets = ac.get_presets(norm) or ac.get_presets(app_name)
+        if not presets:
+            tk.Label(preset_frame, text="No presets for this app.\nUse the custom key sender below.",
+                     bg=C["win_bg"], fg=C["dim"], font=FONT_SM).pack(pady=20)
+            return
+        col, row = 0, 0
+        for action, keys in presets.items():
+            key_str = "+".join(k.upper() for k in keys)
+            lbl = f"{action.title()}\n{key_str}"
+            def _make_cmd(a=action, n=norm or app_name):
+                def _cmd():
+                    def _work():
+                        ok, msg = ac.run_preset(n, a)
+                        win.after(0, lambda: status_var.set(f"  {'✅' if ok else '⚠'}  {msg}"))
+                    threading.Thread(target=_work, daemon=True).start()
+                return _cmd
+            btn = tk.Button(preset_frame, text=lbl,
+                            bg=C["border"], fg=C["text"],
+                            font=("Segoe UI", 8), relief="flat", bd=0,
+                            padx=6, pady=4, wraplength=100, justify="center",
+                            activebackground=C["accent"], activeforeground="white",
+                            command=_make_cmd())
+            btn.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
+            _preset_btns.append(btn)
+            col += 1
+            if col >= 4:
+                col = 0; row += 1
+        for c in range(4):
+            preset_frame.grid_columnconfigure(c, weight=1)
+
+    # ── Window list logic ─────────────────────────────────────────────────────
+    _windows_data = []  # list of (hwnd, title)
+
+    def _refresh_windows():
+        _windows_data.clear()
+        win_lb.delete(0, "end")
+        if not _OK:
+            win_lb.insert("end", "vinx_appcontrol not found")
+            return
+        windows = ac.list_windows()
+        # Deduplicate by title prefix
+        seen = set()
+        for hwnd, title in windows:
+            short = title[:50]
+            if short not in seen:
+                seen.add(short)
+                _windows_data.append((hwnd, title))
+                win_lb.insert("end", f"  {title[:46]}")
+        status_var.set(f"  {len(_windows_data)} windows found")
+
+    def _on_select(event):
+        sel = win_lb.curselection()
+        if not sel or sel[0] >= len(_windows_data):
+            return
+        hwnd, title = _windows_data[sel[0]]
+        _sel_app[0] = title
+        app_title.config(text=f"🖥  {title[:40]}")
+        # Guess app name from title for presets
+        guessed = title.split("—")[0].split("-")[0].strip().lower()
+        _load_presets(guessed)
+
+    win_lb.bind("<<ListboxSelect>>", _on_select)
+
+    def _focus_selected():
+        sel = win_lb.curselection()
+        if not sel or not _OK:
+            return
+        hwnd, title = _windows_data[sel[0]]
+        ok = ac.focus_window(hwnd)
+        status_var.set(f"  {'Focused:' if ok else 'Failed to focus:'} {title[:50]}")
+
+    win_lb.bind("<Double-Button-1>", lambda e: _focus_selected())
+
+    refresh_btn.config(command=lambda: threading.Thread(target=_refresh_windows, daemon=True).start())
+
+    # Initial load
+    threading.Thread(target=_refresh_windows, daemon=True).start()
+
+    lucy_log("APPCONTROL", "appControl opened")

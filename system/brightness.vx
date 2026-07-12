@@ -1,0 +1,232 @@
+# VX:name=Brightness
+# VX:icon=☀
+# VX:version=1.0
+# VX:sig=f6h1Y0kgHW/6r+JM04BfPD05QHD/RzCw0AxxAo/UIM/JyFsjO9RCCmsx/RgbQtdd6Si9ECigP4lhJZDOWMvLBA==
+"""
+Luci Brightness — small floating control panel.
+
+Mirrors the look & UX of volume.vx so the system-controls family
+feels uniform: a horizontal node-style slider, percentage readout,
+sun-icon close button, and quick preset chips.
+
+Backends (tried in order — first one that works wins on this boot):
+  1. FreeBSD `backlight N`     — drives the actual panel; real
+                                   power saving.
+  2. `xrandr --brightness X`   — software gamma scale fallback.
+                                   Doesn't save power (panel still
+                                   at 100 %) but at least the picture
+                                   gets darker for the user's eyes.
+
+Auto-positions in the top-right corner under the menubar, just like
+volume — invoked from the topbar sun glyph (and via .vx Launchpad).
+"""
+
+import os, sys, subprocess, tkinter as tk
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
+from luci import C
+
+
+# ── Backlight I/O ──────────────────────────────────────────────────
+def _read_brightness() -> int:
+    """Return current brightness 0-100. Falls back to 100 on read
+    failure so the slider doesn't start at zero."""
+    try:
+        r = subprocess.run(["backlight"], capture_output=True,
+                            text=True, timeout=2)
+        # FreeBSD `backlight` prints e.g. "brightness: 80"
+        for ln in r.stdout.splitlines():
+            for tok in ln.split():
+                if tok.rstrip("%").isdigit():
+                    return max(0, min(100, int(tok.rstrip("%"))))
+    except Exception:
+        pass
+    return 100
+
+
+def _set_brightness(level: int):
+    """Drive the panel backlight first; fall back to xrandr gamma
+    scaling if that fails (e.g., no acpi backlight on this hardware)."""
+    level = max(1, min(100, int(level)))   # never fully zero — the
+                                             # panel would be black and
+                                             # the user couldn't see
+                                             # the slider to bring it
+                                             # back up.
+    try:
+        r = subprocess.run(["backlight", str(level)],
+                            capture_output=True, text=True, timeout=2)
+        if r.returncode == 0:
+            return
+    except Exception:
+        pass
+    # Software fallback — xrandr gamma. Detect the active output
+    # (usually eDP-1 on a laptop). 0.1 ≤ value ≤ 1.0.
+    try:
+        out = subprocess.run(["xrandr"], capture_output=True,
+                              text=True, timeout=2).stdout
+        target = "eDP-1"
+        for ln in out.splitlines():
+            if " connected" in ln:
+                target = ln.split()[0]
+                break
+        subprocess.run(["xrandr", "--output", target,
+                         "--brightness", f"{level/100:.2f}"],
+                        capture_output=True, timeout=2)
+    except Exception:
+        pass
+
+
+# ── UI ─────────────────────────────────────────────────────────────
+def main(desktop):
+    win = tk.Toplevel(desktop.root)
+    win.overrideredirect(True)
+    W, H = 280, 150
+    sw = win.winfo_screenwidth()
+    win.geometry(f"{W}x{H}+{sw - W - 12}+{30}")
+    try: win.attributes("-topmost", True)
+    except Exception: pass
+
+    BG     = "#0b1322"
+    PANEL  = "#0d1a30"
+    TRACK  = "#1f2d4a"
+    GLOW   = C.get("accent",  "#5ec8ff")
+    TEXT   = "#cfe4ff"
+    DIM    = "#7d99c4"
+    win.configure(bg=BG, highlightbackground="#1f2d4a",
+                   highlightthickness=1)
+
+    state = {"val": _read_brightness()}
+
+    head = tk.Frame(win, bg=BG)
+    head.pack(fill="x", padx=14, pady=(10, 4))
+
+    # Icon — emoji sun, no special action attached (volume uses the
+    # icon for mute, but brightness has no analogous toggle).
+    icon_lbl = tk.Label(head, text="☀", bg=BG, fg=TEXT,
+                         font=("Segoe UI Emoji", 16))
+    icon_lbl.pack(side="left")
+
+    def _close():
+        try: win.destroy()
+        except Exception: pass
+
+    close_btn = tk.Label(head, text="×", bg=BG, fg=DIM,
+                          font=("Segoe UI", 14, "bold"),
+                          cursor="hand2", padx=6)
+    close_btn.pack(side="right")
+    close_btn.bind("<Button-1>", lambda _e: _close())
+    close_btn.bind("<Enter>",
+                    lambda _e: close_btn.config(fg=TEXT))
+    close_btn.bind("<Leave>",
+                    lambda _e: close_btn.config(fg=DIM))
+
+    val_lbl = tk.Label(head, text=f"{state['val']}%",
+                        bg=BG, fg=DIM,
+                        font=("Segoe UI", 10))
+    val_lbl.pack(side="right", padx=(0, 8))
+
+    # ── Slider on a Canvas — copy of volume's draw routine so the
+    # two panels look identical side by side. ─────────────────────
+    cv = tk.Canvas(win, bg=BG, highlightthickness=0, height=42)
+    cv.pack(fill="x", padx=14)
+    PAD = 12
+
+    def _draw(_e=None):
+        cv.delete("all")
+        w = cv.winfo_width() or (W - 28)
+        h = cv.winfo_height() or 42
+        cy = h // 2
+        cv.create_line(PAD, cy, w - PAD, cy, fill=TRACK, width=4,
+                        capstyle="round")
+        v = state["val"] / 100
+        knob_x = PAD + (w - PAD * 2) * v
+        cv.create_line(PAD, cy, knob_x, cy, fill=GLOW, width=4,
+                        capstyle="round")
+        for r, alpha in ((14, "#1a3a55"),
+                          (10, "#2c5b80"),
+                          ( 8, GLOW)):
+            cv.create_oval(knob_x - r, cy - r,
+                            knob_x + r, cy + r,
+                            fill=alpha, outline="")
+        cv.create_oval(knob_x - 6, cy - 6,
+                        knob_x + 6, cy + 6,
+                        fill="#ffffff", outline="")
+    cv.bind("<Configure>", _draw)
+    win.after(40, _draw)
+
+    def _refresh(new_val):
+        state["val"] = max(0, min(100, int(new_val)))
+        val_lbl.config(text=f"{state['val']}%")
+        # Sun icon dims down with brightness — same trick the
+        # volume widget uses for the speaker glyph.
+        if state["val"] < 25:
+            icon_lbl.config(text="🌒")     # crescent — low
+        elif state["val"] < 60:
+            icon_lbl.config(text="🌗")     # half — medium
+        else:
+            icon_lbl.config(text="☀")     # full sun — high
+        _draw()
+
+    def _seek(e):
+        w = cv.winfo_width()
+        x = max(PAD, min(w - PAD, e.x))
+        v = (x - PAD) / (w - PAD * 2) * 100
+        _refresh(v)
+        _set_brightness(state["val"])
+    cv.bind("<Button-1>",  _seek)
+    cv.bind("<B1-Motion>", _seek)
+
+    # ── Quick presets — battery-aware shortcuts ────────────────────
+    # The user's whole reason for asking was "ubos lagi battery";
+    # the 20 % preset is the headline one.
+    presets = tk.Frame(win, bg=BG)
+    presets.pack(fill="x", padx=14, pady=(8, 12))
+
+    def _make_preset(label, val):
+        b = tk.Label(presets, text=label, bg=PANEL, fg=TEXT,
+                      font=("Segoe UI", 9), padx=8, pady=4,
+                      cursor="hand2")
+        b.pack(side="left", padx=2)
+        b.bind("<Button-1>",
+                lambda _e: (_refresh(val), _set_brightness(val)))
+        b.bind("<Enter>",
+                lambda _e: b.config(bg=GLOW, fg="#06101f"))
+        b.bind("<Leave>",
+                lambda _e: b.config(bg=PANEL, fg=TEXT))
+
+    _make_preset("🔋  20%",  20)   # battery saver
+    _make_preset("🌗  50%",  50)   # balanced
+    _make_preset("☀  80%",   80)   # comfortable indoor
+    _make_preset("💯 100%", 100)   # max
+
+    # Close on click outside the panel (toast-style ephemeral UI).
+    # Bound on Luci's root so any click that isn't on this Toplevel's
+    # widgets triggers _close. We re-target the root, not `win`, so
+    # the binding survives win destroy.
+    try:
+        root = desktop.root
+        _tag = f"brightness_close_{id(win)}"
+
+        def _outside(e):
+            try:
+                wx, wy = win.winfo_rootx(), win.winfo_rooty()
+                ww, wh = win.winfo_width(), win.winfo_height()
+                if not (wx <= e.x_root < wx + ww
+                        and wy <= e.y_root < wy + wh):
+                    _close()
+            except Exception:
+                pass
+
+        root.bind_all("<Button-1>", _outside, add="+")
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    import tkinter as _tk
+    r = _tk.Tk(); r.withdraw()
+    class _D: pass
+    d = _D(); d.root = r
+    main(d)
+    r.mainloop()

@@ -1,0 +1,393 @@
+# VX:name=Disk Cleaner
+# VX:icon=🧹
+# VX:version=1.1
+# VX:author=Vincent Ilagan
+# VX:net=none
+# VX:sig=ONQuCu78mLvU7CVNCXPYowyfDACgHXLRuH+HQgadUP2Z+yQsXg49Js5Ii53Gr4xexDi0pbuV6r95UDCwh7PGBg==
+"""Disk Cleaner — free up space safely.
+
+Lists SAFE, well-known cache categories with their live sizes and a
+checkbox each. Nothing is deleted until you tick what you want and
+confirm. A separate "Large files" scan only LISTS big user files for
+manual review — it never auto-deletes, and never touches the system or
+any code repository.
+
+(Drive overview lives in Files → "This PC", not here — they're separate
+tools.)
+
+SAFETY: only fixed, known-safe cache paths under home / temp / package
+cache are ever removed. System files (/usr, /boot, /etc, the Luci
+install) and anything inside a git repository are NEVER touched.
+"""
+
+import os, sys, glob, shutil, subprocess, threading, json
+from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui  import QFont
+from PyQt5.QtWidgets import (QWidget, QFrame, QLabel, QPushButton, QCheckBox,
+                             QVBoxLayout, QHBoxLayout, QScrollArea)
+
+from luci import (_QtLucyWindow, _UI_FAM, C, HOME_DIR, ROOT_DIR, FileManager)
+
+
+def _run(cmd, timeout=20):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def _du_bytes(path):
+    if not path or not os.path.exists(path):
+        return 0
+    out = _run(["du", "-skx", path], timeout=30)
+    try:
+        return int(out.split()[0]) * 1024
+    except Exception:
+        return 0
+
+
+def _fmt(n):
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{int(n)} {u}" if u == "B" else f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def _home(*p):
+    return os.path.join(HOME_DIR, *p)
+
+
+def _glob_many(patterns):
+    out = []
+    for pat in patterns:
+        out.extend(glob.glob(pat))
+    return out
+
+
+CLEAN_CATEGORIES = [
+    {
+        "key": "browser",
+        "label": "Browser cache (Chromium/Chrome)",
+        "note": "Just cache — keeps your history, logins & bookmarks.",
+        "paths": lambda: [d for d in (
+            _home(".cache", "chromium"),
+            _home(".cache", "ungoogled-chromium"),
+            _home(".config", "chromium", "Default", "Cache"),
+            _home(".config", "ungoogled-chromium", "Default", "Cache"),
+            _home(".config", "google-chrome", "Default", "Cache"),
+        ) if os.path.isdir(d)],
+        "mode": "contents",
+    },
+    {
+        "key": "pkg",
+        "label": "Package cache (downloaded installers)",
+        "note": "Re-downloaded automatically if ever needed.",
+        "paths": lambda: ["/var/cache/pkg"] if os.path.isdir("/var/cache/pkg") else [],
+        "mode": "pkgclean",
+    },
+    {
+        "key": "thumbs",
+        "label": "Trash + thumbnails & app caches",
+        "note": "Emptied Trash and regenerable thumbnail caches.",
+        "paths": lambda: [d for d in (
+            os.path.join(ROOT_DIR, ".trash"),
+            _home(".cache", "thumbnails"),
+            _home(".thumbnails"),
+        ) if os.path.isdir(d)],
+        "mode": "contents",
+    },
+    {
+        "key": "temp",
+        "label": "Temp files & Luci logs",
+        "note": "Old /tmp logs and leftover temp scripts.",
+        "paths": lambda: [f for f in _glob_many([
+            "/tmp/luci-*.log", "/tmp/_*.sh", "/tmp/_*.py", "/tmp/luci-*.png",
+        ]) if os.path.basename(f) != "luci-stderr.log"],
+        "mode": "files",
+    },
+]
+
+
+def _pkg_reclaimable():
+    import re
+    out = _run(["sudo", "-n", "pkg", "clean", "-n", "-y"], timeout=30)
+    m = re.search(r'free\s+([\d.]+)\s*([KMGT]?)i?B', out)
+    if not m:
+        return 0
+    mult = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+    return int(float(m.group(1)) * mult.get(m.group(2), 1))
+
+
+def category_size(cat):
+    if cat.get("mode") == "pkgclean":
+        return _pkg_reclaimable()
+    return sum(_du_bytes(p) for p in cat["paths"]())
+
+
+def clean_category(cat):
+    freed = 0
+    mode = cat["mode"]
+    if mode == "pkgclean":
+        before = _du_bytes("/var/cache/pkg")
+        _run(["sudo", "-n", "pkg", "clean", "-y"], timeout=60)
+        return max(0, before - _du_bytes("/var/cache/pkg"))
+    for p in cat["paths"]():
+        try:
+            sz = _du_bytes(p)
+            if mode == "files":
+                os.remove(p); freed += sz
+            elif mode == "contents":
+                for child in os.listdir(p):
+                    cp = os.path.join(p, child)
+                    try:
+                        if os.path.islink(cp) or os.path.isfile(cp):
+                            os.remove(cp)
+                        elif os.path.isdir(cp):
+                            shutil.rmtree(cp, ignore_errors=True)
+                    except Exception:
+                        pass
+                freed += sz
+        except Exception:
+            pass
+    return freed
+
+
+def _inside_repo(path):
+    d = os.path.dirname(os.path.abspath(path))
+    home = os.path.abspath(HOME_DIR)
+    while d and d.startswith(home):
+        if os.path.isdir(os.path.join(d, ".git")):
+            return True
+        nd = os.path.dirname(d)
+        if nd == d:
+            break
+        d = nd
+    return False
+
+
+def scan_large_files(limit=20, min_mb=500):
+    out = _run(["find", HOME_DIR, "-type", "f", "-size", f"+{min_mb}M",
+                "-not", "-path", "*/.cache/*",
+                "-not", "-path", "*/.trash/*",
+                "-not", "-path", "*/.git/*",
+                "-not", "-path", "*/.config/*"], timeout=45)
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or not os.path.isfile(line) or _inside_repo(line):
+            continue
+        try:
+            rows.append((line, os.path.getsize(line)))
+        except Exception:
+            pass
+    rows.sort(key=lambda r: -r[1])
+    return rows[:limit]
+
+
+class CleanRow(QFrame):
+    def __init__(self, cat, parent=None):
+        super().__init__(parent)
+        self.cat = cat
+        self._bytes = 0
+        self.setStyleSheet("background:transparent;")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 8, 12, 8); lay.setSpacing(10)
+        self.chk = QCheckBox()
+        self.chk.setStyleSheet("QCheckBox::indicator{width:18px;height:18px;}")
+        lay.addWidget(self.chk)
+        col = QVBoxLayout(); col.setSpacing(1)
+        lbl = QLabel(cat["label"]); lbl.setFont(QFont(_UI_FAM, 9, QFont.DemiBold))
+        lbl.setStyleSheet("color:#dce8f8;background:transparent;")
+        col.addWidget(lbl)
+        note = QLabel(cat["note"]); note.setFont(QFont(_UI_FAM, 8))
+        note.setStyleSheet("color:#8ca2c8;background:transparent;")
+        col.addWidget(note)
+        lay.addLayout(col, 1)
+        self.size_lbl = QLabel("…"); self.size_lbl.setFont(QFont(_UI_FAM, 10, QFont.DemiBold))
+        self.size_lbl.setStyleSheet("color:#6ec882;background:transparent;")
+        lay.addWidget(self.size_lbl)
+
+    def set_size(self, n):
+        self._bytes = n
+        self.size_lbl.setText(_fmt(n) if n else "empty")
+        self.chk.setEnabled(n > 0)
+
+
+class DiskCleaner(_QtLucyWindow):
+    sizes_ready = pyqtSignal(object)
+    large_ready = pyqtSignal(object)
+
+    def __init__(self, desktop):
+        super().__init__(desktop, "Disk Cleaner", 700, 660, "🧹")
+        self._desktop = desktop
+        self._rows = {}
+        self.sizes_ready.connect(self._apply_sizes)
+        self.large_ready.connect(self._render_large)
+        self._build()
+        self._refresh()
+
+    def _build(self):
+        root = QVBoxLayout(self.content)
+        root.setContentsMargins(14, 10, 14, 14); root.setSpacing(10)
+        head = QLabel("🧹  Disk Cleaner")
+        head.setFont(QFont(_UI_FAM, 14, QFont.Bold))
+        head.setStyleSheet("color:#dce8f8;background:transparent;")
+        root.addWidget(head)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setStyleSheet(
+            "QScrollArea{background:transparent;}"
+            "QScrollBar:vertical{background:transparent;width:8px;}"
+            "QScrollBar::handle:vertical{background:rgba(120,160,220,90);"
+            "border-radius:4px;min-height:24px;}"
+            "QScrollBar::add-line,QScrollBar::sub-line{height:0;}")
+        inner = QWidget(); inner.setStyleSheet("background:transparent;")
+        self._v = QVBoxLayout(inner)
+        self._v.setContentsMargins(2, 2, 8, 2); self._v.setSpacing(8)
+
+        self._v.addWidget(self._section("Clean up space"))
+        for cat in CLEAN_CATEGORIES:
+            row = CleanRow(cat)
+            self._rows[cat["key"]] = row
+            self._v.addWidget(row)
+
+        self._v.addSpacing(6)
+        self._v.addWidget(self._section("Large files (review & delete manually)"))
+        self._large_host = QWidget(); self._large_host.setStyleSheet("background:transparent;")
+        self._large_lay = QVBoxLayout(self._large_host)
+        self._large_lay.setContentsMargins(0, 0, 0, 0); self._large_lay.setSpacing(4)
+        self._v.addWidget(self._large_host)
+        self._v.addStretch(1)
+        self._scroll.setWidget(inner)
+        root.addWidget(self._scroll, 1)
+
+        foot = QHBoxLayout()
+        self._status = QLabel("scanning…")
+        self._status.setFont(QFont(_UI_FAM, 9))
+        self._status.setStyleSheet("color:#8ca2c8;background:transparent;")
+        foot.addWidget(self._status); foot.addStretch(1)
+        b_refresh = QPushButton("↻  Rescan")
+        b_clean   = QPushButton("🧹  Clean selected")
+        b_refresh.setCursor(Qt.PointingHandCursor); b_clean.setCursor(Qt.PointingHandCursor)
+        b_refresh.setStyleSheet(
+            "QPushButton{background:rgba(255,255,255,18);color:#dce8f8;"
+            "border:1px solid rgba(255,255,255,40);border-radius:8px;"
+            "padding:8px 16px;}QPushButton:hover{background:rgba(255,255,255,38);}")
+        b_clean.setStyleSheet(
+            "QPushButton{background:#5b9fff;color:white;border:none;"
+            "border-radius:8px;padding:8px 18px;font-weight:600;}"
+            "QPushButton:hover{background:#74b0ff;}")
+        b_refresh.clicked.connect(self._refresh)
+        b_clean.clicked.connect(self._clean_selected)
+        foot.addWidget(b_refresh); foot.addWidget(b_clean)
+        root.addLayout(foot)
+
+    def _section(self, text):
+        lbl = QLabel(text.upper())
+        lbl.setFont(QFont(_UI_FAM, 9, QFont.DemiBold))
+        lbl.setStyleSheet("color:#5b9fff;letter-spacing:2px;background:transparent;")
+        return lbl
+
+    def _refresh(self):
+        self._status.setText("scanning caches…")
+        threading.Thread(target=self._scan_worker, daemon=True).start()
+
+    def _scan_worker(self):
+        try:
+            sizes = {c["key"]: category_size(c) for c in CLEAN_CATEGORIES}
+        except Exception:
+            sizes = {}
+        self.sizes_ready.emit(sizes)
+        try:
+            self.large_ready.emit(scan_large_files())
+        except Exception:
+            self.large_ready.emit([])
+
+    def _apply_sizes(self, sizes):
+        total = 0
+        for k, row in self._rows.items():
+            n = sizes.get(k, 0)
+            row.set_size(n)
+            row.chk.setChecked(n > 0 and k != "pkg")
+            total += n
+        self._status.setText(f"Reclaimable now: ~{_fmt(total)}  ·  tick items, then Clean")
+
+    def _render_large(self, rows):
+        while self._large_lay.count():
+            it = self._large_lay.takeAt(0)
+            if it.widget(): it.widget().deleteLater()
+        if not rows:
+            lbl = QLabel("  No unusually large files in your home folder.")
+            lbl.setFont(QFont(_UI_FAM, 8))
+            lbl.setStyleSheet("color:#8ca2c8;background:transparent;")
+            self._large_lay.addWidget(lbl)
+            return
+        for path, sz in rows:
+            r = QFrame(); r.setStyleSheet("background:transparent;")
+            h = QHBoxLayout(r); h.setContentsMargins(8, 2, 8, 2); h.setSpacing(8)
+            nm = QLabel(os.path.basename(path)); nm.setFont(QFont(_UI_FAM, 9))
+            nm.setToolTip(path); nm.setStyleSheet("color:#dce8f8;background:transparent;")
+            h.addWidget(nm, 1)
+            szl = QLabel(_fmt(sz)); szl.setFont(QFont(_UI_FAM, 9, QFont.DemiBold))
+            szl.setStyleSheet("color:#ffc850;background:transparent;")
+            h.addWidget(szl)
+            ob = QPushButton("Open folder"); ob.setCursor(Qt.PointingHandCursor)
+            ob.setStyleSheet(
+                "QPushButton{background:rgba(255,255,255,16);color:#dce8f8;"
+                "border:1px solid rgba(255,255,255,38);border-radius:6px;"
+                "padding:3px 10px;font-size:11px;}"
+                "QPushButton:hover{background:rgba(255,255,255,34);}")
+            ob.clicked.connect(lambda _=False, p=path: self._open_folder(os.path.dirname(p)))
+            h.addWidget(ob)
+            self._large_lay.addWidget(r)
+
+    def _open_folder(self, d):
+        try:
+            fm = FileManager(self._desktop); fm._load(d)
+        except Exception:
+            pass
+
+    def _clean_selected(self):
+        chosen = [self._rows[k].cat for k in self._rows
+                  if self._rows[k].chk.isChecked() and self._rows[k].chk.isEnabled()]
+        if not chosen:
+            self._status.setText("Nothing selected to clean.")
+            return
+        lines = "\n".join(f"  •  {c['label']}   "
+                          f"({_fmt(getattr(self._rows[c['key']], '_bytes', 0))})"
+                          for c in chosen)
+        from PyQt5.QtWidgets import QMessageBox
+        box = QMessageBox(self)
+        box.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        box.setIcon(QMessageBox.Warning)
+        box.setText("Clean these now?")
+        box.setInformativeText(lines +
+            "\n\nOnly caches are removed. Your files, the system and any "
+            "code repository are never touched.")
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        box.setDefaultButton(QMessageBox.Cancel)
+        if box.exec_() != QMessageBox.Yes:
+            return
+        self._status.setText("cleaning…")
+        cats = chosen
+        def work():
+            freed = sum(clean_category(c) for c in cats)
+            self.sizes_ready.emit({c["key"]: category_size(c) for c in CLEAN_CATEGORIES})
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(0, lambda: self._after_clean(freed))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_clean(self, freed):
+        self._status.setText(f"✅ Freed {_fmt(freed)}.")
+        try: self._desktop._toast(f"🧹 Disk Cleaner freed {_fmt(freed)}")
+        except Exception: pass
+        self._refresh()
+
+
+def main(desktop):
+    DiskCleaner(desktop)

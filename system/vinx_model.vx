@@ -1,0 +1,262 @@
+# VX:name=VinX Model
+# VX:icon=🧠
+# VX:version=1.0
+# VX:author=VinX
+# VX:sig=9YM2/a5Km53kncALBCqKDoEphmURqJS2KotNRkLC5iD1ioKdw2Wi7Hg9ym9MCJte3qoImJOl40t6tObSv2bABA==
+
+# ════════════════════════════════════════════════════════════════════════════
+#  VinX Model Picker
+#  Freely choose which .gguf model VinX uses.
+#
+#  VinX (vinx_local.py) always loads the file named  vinX.gguf  in
+#  memory/models/. This app does NOT change VinX — it just manages WHICH
+#  model file sits in that slot. Pick any .gguf; it becomes the active one.
+#
+#  Safe: it NEVER deletes a model. The previously-active model is preserved
+#  in the library under its own name before a new one is made active.
+# ════════════════════════════════════════════════════════════════════════════
+
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import os, sys, shutil, threading
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from luci import C, FONT_BOLD, FONT_SM, lucy_log
+try:
+    from luci import _VINX_SRC
+except Exception:
+    _VINX_SRC = ""
+
+ACTIVE_NAME = "vinX.gguf"          # the filename VinX always loads
+
+
+def _models_dir():
+    base = _VINX_SRC or os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    d = os.path.join(base, "memory", "models")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _gb(path):
+    try:
+        return os.path.getsize(path) / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
+def main(desktop):
+    models_dir = _models_dir()
+    active     = os.path.join(models_dir, ACTIVE_NAME)
+    state      = {"busy": False}
+
+    win = tk.Toplevel(desktop.root)
+    win.overrideredirect(True)
+    win.configure(bg="#0a0f14")
+    w, h = 460, 460
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+    win.lift()
+
+    # ── Title bar ────────────────────────────────────────────────────────────
+    # ── Title bar (global Luci chrome) ─────────────────────────────
+    if hasattr(desktop, "apply_chrome"):
+        desktop.apply_chrome(win, title="VinX Model",
+                              icon="🧠", include_body=False)
+    else:
+        bar = tk.Frame(win, bg="#10202c", height=30)
+        bar.pack(fill="x"); bar.pack_propagate(False)
+        tk.Label(bar, text="  🧠  VinX Model", bg="#10202c", fg="#7fd0ff",
+                 font=FONT_BOLD).pack(side="left", fill="y")
+        tk.Button(bar, text="✕", bg="#10202c", fg=C["dim"], activebackground=C["red"],
+                  font=FONT_BOLD, relief="flat", bd=0, padx=10,
+                  command=win.destroy).pack(side="right", fill="y")
+        _d = [None]
+        bar.bind("<ButtonPress-1>",
+                 lambda e: _d.__setitem__(0, (e.x_root-win.winfo_x(), e.y_root-win.winfo_y())))
+        bar.bind("<B1-Motion>",
+             lambda e: win.geometry(f"+{e.x_root-_d[0][0]}+{e.y_root-_d[0][1]}")
+             if _d[0] else None)
+
+    info = tk.Label(win, text="", bg="#0a0f14", fg=C["dim"],
+                    font=("Consolas", 8), anchor="w", justify="left")
+    info.pack(fill="x", padx=12, pady=(8, 2))
+
+    # ── Compute mode (CPU / GPU / Both / Auto) ───────────────────────────
+    # Written to memory/compute.json; vinx_chat_worker reads it at model
+    # load. GPU/Both need a Vulkan/CUDA build of llama-cpp-python — on
+    # a CPU-only build they silently fall back to CPU (safe).
+    import json as _json
+    compute_path = os.path.join(os.path.dirname(models_dir),
+                                "compute.json")
+    def _read_mode():
+        try:
+            with open(compute_path) as f:
+                return _json.load(f).get("mode", "auto")
+        except Exception:
+            return "auto"
+    comp_fr = tk.Frame(win, bg="#0a0f14")
+    comp_fr.pack(fill="x", padx=12, pady=(0, 2))
+    tk.Label(comp_fr, text="  Compute:", bg="#0a0f14", fg=C["dim"],
+             font=("Consolas", 8)).pack(side="left")
+    _mode_var = tk.StringVar(value=_read_mode())
+    def _save_mode():
+        try:
+            with open(compute_path, "w") as f:
+                _json.dump({"mode": _mode_var.get()}, f)
+            _set_status(f"Compute mode: {_mode_var.get()} — applies on "
+                        "next model load")
+        except Exception as ex:
+            _set_status(f"compute save failed: {ex}", err=True)
+    for val, lbl in (("auto", "Auto"), ("cpu", "CPU"),
+                     ("gpu", "GPU"), ("both", "Both")):
+        tk.Radiobutton(
+            comp_fr, text=lbl, value=val, variable=_mode_var,
+            command=_save_mode,
+            bg="#0a0f14", fg="#cfe3ff", selectcolor="#11314f",
+            activebackground="#0a0f14", activeforeground="#7fd0ff",
+            font=("Consolas", 8), bd=0, highlightthickness=0,
+        ).pack(side="left", padx=3)
+
+    listwrap = tk.Frame(win, bg="#070b0f")
+    listwrap.pack(fill="both", expand=True, padx=12, pady=4)
+
+    status = tk.Label(win, text="", bg="#0a0f14", fg="#7fd0ff",
+                      font=("Consolas", 8), anchor="w")
+    status.pack(fill="x", padx=12, pady=(0, 4))
+
+    def _set_status(msg, err=False):
+        status.config(text="  " + msg, fg=(C["red"] if err else "#7fd0ff"))
+
+    # ── activate a chosen model (threaded copy) ──────────────────────────────
+    def _activate(src):
+        if state["busy"]:
+            return
+        if os.path.abspath(src) == os.path.abspath(active):
+            _set_status("Already the active model.")
+            return
+        state["busy"] = True
+        _set_status(f"Activating {os.path.basename(src)} … please wait")
+
+        def _work():
+            try:
+                # Preserve the currently-active model — never delete it.
+                if os.path.isfile(active):
+                    same = any(
+                        f != ACTIVE_NAME and os.path.isfile(os.path.join(models_dir, f))
+                        and os.path.getsize(os.path.join(models_dir, f)) == os.path.getsize(active)
+                        for f in os.listdir(models_dir) if f.endswith(".gguf"))
+                    if not same:
+                        keep = os.path.join(
+                            models_dir, f"vinX_kept_{_gb(active):.1f}GB.gguf")
+                        n = 1
+                        while os.path.isfile(keep):
+                            keep = os.path.join(models_dir,
+                                f"vinX_kept_{_gb(active):.1f}GB_{n}.gguf"); n += 1
+                        os.rename(active, keep)
+                    else:
+                        os.remove(active)
+                # Put the chosen model into the active slot.
+                try:
+                    os.link(src, active)            # instant, no extra space
+                except Exception:
+                    shutil.copy2(src, active)        # fallback — real copy
+                win.after(0, lambda: _set_status(
+                    f"✓ Active model: {os.path.basename(src)}"))
+                lucy_log("VINX", f"Active model set: {os.path.basename(src)}")
+            except Exception as e:
+                win.after(0, lambda: _set_status(f"Failed: {e}", err=True))
+            finally:
+                state["busy"] = False
+                win.after(0, _refresh)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    # ── import a .gguf from anywhere into the model library ──────────────────
+    def _import():
+        if state["busy"]:
+            return
+        path = filedialog.askopenfilename(
+            parent=win, title="Choose a .gguf model",
+            filetypes=[("GGUF model", "*.gguf"), ("All files", "*.*")])
+        if not path:
+            return
+        dst = os.path.join(models_dir, os.path.basename(path))
+        if os.path.abspath(path) == os.path.abspath(dst):
+            _activate(path); return
+        state["busy"] = True
+        _set_status(f"Importing {os.path.basename(path)} … please wait")
+
+        def _work():
+            try:
+                try:
+                    os.link(path, dst)
+                except Exception:
+                    shutil.copy2(path, dst)
+                win.after(0, lambda: _set_status(
+                    f"Imported {os.path.basename(path)} — now click Set Active"))
+            except Exception as e:
+                win.after(0, lambda: _set_status(f"Import failed: {e}", err=True))
+            finally:
+                state["busy"] = False
+                win.after(0, _refresh)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    # ── redraw the model list ────────────────────────────────────────────────
+    def _refresh():
+        for c in list(listwrap.winfo_children()):
+            c.destroy()
+        ggufs = sorted(f for f in os.listdir(models_dir)
+                       if f.lower().endswith(".gguf"))
+        act_size = os.path.getsize(active) if os.path.isfile(active) else -1
+
+        if os.path.isfile(active):
+            info.config(text=f"  Active slot: {ACTIVE_NAME}   "
+                             f"{_gb(active):.1f} GB   (~{_gb(active)*1.1:.1f} GB RAM)")
+        else:
+            info.config(text="  No active model — pick or import a .gguf below.")
+
+        if not ggufs:
+            tk.Label(listwrap, text="\n  No .gguf models found.\n"
+                     "  Click 'Import a .gguf' to add one.",
+                     bg="#070b0f", fg=C["dim"], font=FONT_SM,
+                     justify="left").pack(anchor="w", padx=8, pady=8)
+            return
+
+        for f in ggufs:
+            fp = os.path.join(models_dir, f)
+            is_active = (f == ACTIVE_NAME) or (
+                os.path.isfile(fp) and os.path.getsize(fp) == act_size
+                and act_size > 0)
+            row = tk.Frame(listwrap, bg="#0d161d")
+            row.pack(fill="x", padx=4, pady=2)
+            dot = "●" if is_active else "○"
+            tk.Label(row, text=f"  {dot} {f}", bg="#0d161d",
+                     fg=("#4fd28a" if is_active else C["text"]),
+                     font=FONT_SM, anchor="w").pack(side="left", fill="x",
+                                                     expand=True)
+            tk.Label(row, text=f"{_gb(fp):.1f} GB ", bg="#0d161d", fg=C["dim"],
+                     font=("Consolas", 8)).pack(side="left")
+            if is_active:
+                tk.Label(row, text=" ACTIVE ", bg="#13351f", fg="#4fd28a",
+                         font=("Consolas", 8, "bold")).pack(side="right", padx=4)
+            elif f != ACTIVE_NAME:
+                tk.Button(row, text="Set Active", bg="#1a3a52", fg="#bfe6ff",
+                          font=("Segoe UI", 8), relief="flat", bd=0, padx=8,
+                          activebackground="#245074",
+                          command=lambda p=fp: _activate(p)).pack(side="right",
+                                                                  padx=4, pady=2)
+
+    btnrow = tk.Frame(win, bg="#0a0f14")
+    btnrow.pack(fill="x", padx=12, pady=(2, 10))
+    tk.Button(btnrow, text="📂  Import a .gguf …", bg="#13351f", fg="#9fe6bf",
+              font=FONT_SM, relief="flat", bd=0, padx=12, pady=6,
+              activebackground="#1d4d2d", command=_import).pack(side="left")
+    tk.Label(btnrow, text="  VinX loads whatever sits in the active slot.",
+             bg="#0a0f14", fg=C["dim"], font=("Segoe UI", 8)).pack(side="left",
+                                                                   padx=8)
+
+    _refresh()
+    _set_status("Pick a model, or import any .gguf you like.")
+    lucy_log("VINX_MODEL", "VinX Model picker opened")

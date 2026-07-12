@@ -1,0 +1,273 @@
+# VX:name=System Health
+# VX:icon=🩺
+# VX:version=1.0
+# VX:author=Vincent Ilagan
+# VX:sig=9jT7QLkq4ub1YFrTcxg0FtQ+/MpbePe6KVHK7htz+jlvAtA6y/fLw4g6oovWqhhVoIIRV7+svdzmQleM2BtPAw==
+"""
+systemhealth.vx — battery + hardware health for Luci OS.
+
+Shows what a laptop owner actually wants to know:
+  • Battery health   — last-full vs design capacity, cycle count, charge,
+                       charging state (acpiconf / hw.acpi.battery).
+  • Thermals         — CPU temperature (coretemp sysctl) + GPU temperature
+                       (nvidia-smi), colour-coded.
+  • Storage          — disk usage, and NVMe wear/temperature via
+                       nvmecontrol when available.
+An overall banner turns amber if anything needs attention. Pure sysctl /
+acpiconf / nvidia-smi / nvmecontrol — 100% original Luci UI.
+"""
+import os, sys, re, shutil, subprocess
+
+from PyQt5.QtCore    import Qt, QTimer
+from PyQt5.QtGui     import QFont
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                             QFrame, QProgressBar, QGridLayout)
+
+from luci import _QtLucyWindow, _UI_FAM
+
+
+def _run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=4).stdout
+    except Exception:
+        return ""
+
+
+def _sysctl(name):
+    return _run(["sysctl", "-n", name]).strip()
+
+
+def _battery():
+    out = _run(["acpiconf", "-i", "0"])
+    d = {}
+    for ln in out.splitlines():
+        if ":" in ln:
+            k, v = ln.split(":", 1)
+            d[k.strip()] = v.strip()
+    b = {}
+    try:
+        design = float(re.sub(r"[^0-9.]", "", d.get("Design capacity", "0")))
+        full = float(re.sub(r"[^0-9.]", "", d.get("Last full capacity", "0")))
+        b["health"] = (full / design * 100.0) if design else 0.0
+        b["design"] = design; b["full"] = full
+    except Exception:
+        b["health"] = 0.0
+    b["cycles"] = d.get("Cycle Count", "—")
+    b["state"] = d.get("State", "—")
+    b["model"] = d.get("Model number", "—")
+    b["tech"] = d.get("Type", d.get("Technology", "—"))
+    try:
+        b["charge"] = float(_sysctl("hw.acpi.battery.life") or "0")
+    except Exception:
+        b["charge"] = 0.0
+    b["ac"] = _sysctl("hw.acpi.acline") == "1"
+    return b
+
+
+def _cpu_temp():
+    temps = []
+    i = 0
+    while i < 64:
+        v = _sysctl("dev.cpu.%d.temperature" % i)
+        if not v:
+            break
+        try: temps.append(float(v.replace("C", "")))
+        except Exception: pass
+        i += 1
+    return max(temps) if temps else None
+
+
+def _gpu_temp():
+    v = _run(["nvidia-smi", "--query-gpu=temperature.gpu",
+              "--format=csv,noheader,nounits"]).strip()
+    try: return float(v.splitlines()[0])
+    except Exception: return None
+
+
+def _nvme(dev="nda0"):
+    out = _run(["nvmecontrol", "logpage", "-p", "2", dev])
+    info = {}
+    for ln in out.splitlines():
+        low = ln.lower()
+        if "percentage used" in low:
+            m = re.search(r"(\d+)", ln); info["used"] = m.group(1) if m else None
+        elif "available spare" in low and "threshold" not in low:
+            m = re.search(r"(\d+)", ln); info["spare"] = m.group(1) if m else None
+        elif "temperature:" in low and "sensor" not in low:
+            m = re.search(r"(\d+)\s*K", ln)
+            if m: info["temp"] = float(m.group(1)) - 273.15
+    return info
+
+
+def _tint(ok, warn, val, invert=False):
+    """Green/amber/red by thresholds. invert=True → higher is better."""
+    if val is None:
+        return "#8ca2c8"
+    good = (val >= ok) if invert else (val <= ok)
+    mid = (val >= warn) if invert else (val <= warn)
+    return "#38d39f" if good else ("#febc2e" if mid else "#ff5f57")
+
+
+class _Card(QFrame):
+    def __init__(self, title, icon):
+        super().__init__()
+        self.setStyleSheet("QFrame{background:rgba(30,38,60,120);border:1px solid "
+                           "rgba(120,160,220,50);border-radius:14px;}")
+        self.lay = QVBoxLayout(self); self.lay.setContentsMargins(16, 12, 16, 14)
+        self.lay.setSpacing(8)
+        h = QLabel("%s  %s" % (icon, title)); h.setFont(QFont(_UI_FAM, 11, QFont.Bold))
+        h.setStyleSheet("color:#dbe6fb;background:transparent;border:none;")
+        self.lay.addWidget(h)
+
+    def row(self, label, value_widget):
+        r = QHBoxLayout()
+        l = QLabel(label); l.setStyleSheet("color:#9fb2d8;background:transparent;border:none;")
+        l.setFont(QFont(_UI_FAM, 9)); r.addWidget(l); r.addStretch(1)
+        r.addWidget(value_widget)
+        self.lay.addLayout(r)
+
+
+def _bar(color):
+    b = QProgressBar(); b.setRange(0, 100); b.setTextVisible(True)
+    b.setFixedHeight(18)
+    b.setStyleSheet(
+        "QProgressBar{background:rgba(255,255,255,20);border:none;border-radius:9px;"
+        "color:#eaf2ff;text-align:center;font-size:10px;}"
+        "QProgressBar::chunk{background:%s;border-radius:9px;}" % color)
+    return b
+
+
+def _v(text="—", color="#eaf2ff", bold=True):
+    l = QLabel(text); l.setStyleSheet("color:%s;background:transparent;border:none;" % color)
+    l.setFont(QFont(_UI_FAM, 11, QFont.Bold if bold else QFont.Normal))
+    return l
+
+
+class SystemHealth(_QtLucyWindow):
+    def __init__(self, desktop):
+        super().__init__(desktop, "System Health", 720, 660, "🩺")
+        self._desktop = desktop
+        self._build()
+        self._timer = QTimer(self); self._timer.timeout.connect(self._refresh)
+        self._timer.start(3000)
+        self._refresh()
+
+    def _build(self):
+        root = QVBoxLayout(self.content)
+        root.setContentsMargins(14, 12, 14, 14); root.setSpacing(12)
+
+        self.banner = QLabel("Checking system health…")
+        self.banner.setFont(QFont(_UI_FAM, 12, QFont.Bold))
+        self.banner.setStyleSheet(
+            "color:#eaf2ff;background:rgba(56,211,159,40);border:1px solid "
+            "rgba(56,211,159,120);border-radius:12px;padding:12px;")
+        self.banner.setAlignment(Qt.AlignCenter)
+        root.addWidget(self.banner)
+
+        # Battery card
+        self.c_bat = _Card("Battery health", "🔋")
+        self.bat_healthbar = _bar("#38d39f"); self.c_bat.lay.addWidget(self.bat_healthbar)
+        self.bat_healthlbl = _v(); self.c_bat.row("Health (last-full ÷ design)", self.bat_healthlbl)
+        self.bat_charge = _v(); self.c_bat.row("Current charge", self.bat_charge)
+        self.bat_state = _v(); self.c_bat.row("State", self.bat_state)
+        self.bat_cycles = _v(); self.c_bat.row("Cycle count", self.bat_cycles)
+        self.bat_model = _v(bold=False); self.c_bat.row("Model / type", self.bat_model)
+        root.addWidget(self.c_bat)
+
+        # Thermals card
+        self.c_th = _Card("Temperatures", "🌡")
+        self.cpu_temp = _v(); self.c_th.row("CPU", self.cpu_temp)
+        self.gpu_temp = _v(); self.c_th.row("GPU (GTX 1060)", self.gpu_temp)
+        root.addWidget(self.c_th)
+
+        # Storage card
+        self.c_st = _Card("Storage", "💽")
+        self.disk_bar = _bar("#4c8dff"); self.c_st.lay.addWidget(self.disk_bar)
+        self.disk_use = _v(bold=False); self.c_st.row("Disk usage", self.disk_use)
+        self.nvme_used = _v(); self.c_st.row("NVMe wear (percentage used)", self.nvme_used)
+        self.nvme_spare = _v(); self.c_st.row("NVMe available spare", self.nvme_spare)
+        root.addWidget(self.c_st)
+        root.addStretch(1)
+
+    def _refresh(self):
+        try:
+            self._update()
+        except Exception as ex:
+            self.banner.setText("health read error: %s" % ex)
+
+    def _update(self):
+        warns = []
+
+        # Battery
+        b = _battery()
+        hp = b.get("health", 0.0)
+        col = _tint(80, 60, hp, invert=True)
+        self.bat_healthbar.setValue(int(hp))
+        self.bat_healthbar.setFormat("%.0f%%" % hp)
+        self.bat_healthbar.setStyleSheet(
+            "QProgressBar{background:rgba(255,255,255,20);border:none;border-radius:9px;"
+            "color:#eaf2ff;text-align:center;font-size:10px;}"
+            "QProgressBar::chunk{background:%s;border-radius:9px;}" % col)
+        self.bat_healthlbl.setText("%.0f%%  (%.0f / %.0f mWh)" %
+                                   (hp, b.get("full", 0), b.get("design", 0)))
+        self.bat_healthlbl.setStyleSheet("color:%s;background:transparent;border:none;" % col)
+        self.bat_charge.setText("%.0f%%%s" % (b.get("charge", 0),
+                                              "  (plugged in)" if b.get("ac") else "  (on battery)"))
+        self.bat_state.setText(str(b.get("state", "—")))
+        self.bat_cycles.setText(str(b.get("cycles", "—")))
+        self.bat_model.setText("%s · %s" % (b.get("model", "—"), b.get("tech", "—")))
+        if hp and hp < 70:
+            warns.append("battery health %.0f%%" % hp)
+
+        # Thermals
+        ct = _cpu_temp(); gt = _gpu_temp()
+        cc = _tint(60, 80, ct)
+        self.cpu_temp.setText("%.0f °C" % ct if ct is not None else "n/a")
+        self.cpu_temp.setStyleSheet("color:%s;background:transparent;border:none;" % cc)
+        gc = _tint(65, 85, gt)
+        self.gpu_temp.setText("%.0f °C" % gt if gt is not None else "n/a")
+        self.gpu_temp.setStyleSheet("color:%s;background:transparent;border:none;" % gc)
+        if ct and ct > 85: warns.append("CPU %.0f°C" % ct)
+        if gt and gt > 88: warns.append("GPU %.0f°C" % gt)
+
+        # Storage
+        try:
+            u = shutil.disk_usage("/")
+            pct = u.used / u.total * 100 if u.total else 0
+            self.disk_bar.setValue(int(pct))
+            self.disk_bar.setFormat("%.0f%%" % pct)
+            self.disk_use.setText("%.1f / %.1f GB used  ·  %.1f GB free" % (
+                u.used / 1e9, u.total / 1e9, u.free / 1e9))
+            if pct > 90: warns.append("disk %.0f%% full" % pct)
+        except Exception:
+            self.disk_use.setText("n/a")
+        nv = _nvme("nda0")
+        used = nv.get("used")
+        self.nvme_used.setText((used + "%") if used is not None else "n/a")
+        if used is not None:
+            uc = _tint(20, 80, float(used))
+            self.nvme_used.setStyleSheet("color:%s;background:transparent;border:none;" % uc)
+        sp = nv.get("spare")
+        self.nvme_spare.setText((sp + "%") if sp is not None else "n/a")
+
+        # Banner
+        if warns:
+            self.banner.setText("⚠  Needs attention:  " + " · ".join(warns))
+            self.banner.setStyleSheet(
+                "color:#eaf2ff;background:rgba(254,188,46,45);border:1px solid "
+                "rgba(254,188,46,130);border-radius:12px;padding:12px;")
+        else:
+            self.banner.setText("✓  All systems healthy")
+            self.banner.setStyleSheet(
+                "color:#eaf2ff;background:rgba(56,211,159,40);border:1px solid "
+                "rgba(56,211,159,120);border-radius:12px;padding:12px;")
+
+    def closeEvent(self, e):
+        try: self._timer.stop()
+        except Exception: pass
+        super().closeEvent(e)
+
+
+def main(desktop):
+    SystemHealth(desktop)

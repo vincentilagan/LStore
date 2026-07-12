@@ -1,0 +1,172 @@
+# VX:name=sysApps
+# VX:icon=🖥
+# VX:version=1.0
+# VX:author=Vincent Ilagan
+# VX:sig=8LWzwX/M+Xmz/i7NVJo3nb9HuLtQG5giPgKrS1S7toUhrTxuKZqurDE9CAj7x//yibcEQrSgoFTvojFAHULWAA==
+
+import tkinter as tk
+from tkinter import ttk
+import threading, os, sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from luci import C, FONT, FONT_BOLD, FONT_SM, lucy_log
+
+_VINX_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, _VINX_DIR)
+try:
+    import vinx_sysapps
+    _OK = True
+except ImportError:
+    _OK = False
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main(desktop):
+    win = tk.Toplevel(desktop.root)
+    win.overrideredirect(True)
+    win.configure(bg=C["border"])
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    w, h   = 680, 520
+    offset = len(desktop._windows) * 24
+    win.geometry(f"{w}x{h}+{max(0,(sw-w)//2+offset)}+{max(30,(sh-h)//2+offset)}")
+    win.attributes("-topmost", False)
+    win.lift()
+
+    _all_apps   = {}   # name → path
+    _filtered   = []   # current list of (name, path) shown
+
+    # ── Title bar ─────────────────────────────────────────────────────────────
+    # ── Title bar (global Luci chrome) ─────────────────────────────
+    if hasattr(desktop, "apply_chrome"):
+        desktop.apply_chrome(win, title="sysApps — VinX App Control",
+                              icon="🖥", include_body=False)
+    else:
+        bar = tk.Frame(win, bg=C["win_title"], height=32)
+        bar.pack(fill="x"); bar.pack_propagate(False)
+        tk.Label(bar, text="  🖥  sysApps — VinX App Control", bg=C["win_title"],
+                 fg=C["accent2"], font=FONT_BOLD).pack(side="left", fill="y")
+        tk.Button(bar, text="✕", bg=C["win_title"], fg=C["dim"],
+                  activebackground=C["red"], activeforeground="white",
+                  font=FONT_BOLD, relief="flat", bd=0, padx=10,
+                  command=win.destroy).pack(side="right", fill="y")
+        tk.Button(bar, text="─", bg=C["win_title"], fg=C["dim"],
+                  activebackground=C["border"],
+                  font=FONT_BOLD, relief="flat", bd=0, padx=10,
+                  command=win.withdraw).pack(side="right", fill="y")
+        drag = [None]
+        bar.bind("<ButtonPress-1>", lambda e: drag.__setitem__(0, (e.x_root-win.winfo_x(), e.y_root-win.winfo_y())))
+        bar.bind("<B1-Motion>",     lambda e: win.geometry(f"+{e.x_root-drag[0][0]}+{e.y_root-drag[0][1]}") if drag[0] else None)
+
+    # ── Search bar ────────────────────────────────────────────────────────────
+    top = tk.Frame(win, bg=C["panel"], height=44)
+    top.pack(fill="x", padx=1); top.pack_propagate(False)
+
+    tk.Label(top, text=" 🔍", bg=C["panel"], fg=C["dim"],
+             font=("Segoe UI Emoji", 13)).pack(side="left", padx=(8, 0), fill="y")
+
+    search_var = tk.StringVar()
+    search_entry = tk.Entry(top, textvariable=search_var, bg=C["border"], fg=C["text"],
+                            font=("Segoe UI", 11), insertbackground="white",
+                            relief="flat", bd=6)
+    search_entry.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+    search_entry.focus()
+
+    def _refresh_btn_cmd():
+        status_var.set("  Rescanning…")
+        win.update_idletasks()
+        threading.Thread(target=_do_scan, args=(True,), daemon=True).start()
+
+    tk.Button(top, text="↻ Rescan", bg=C["panel"], fg=C["dim"],
+              font=FONT_SM, relief="flat", bd=0, padx=10,
+              activebackground=C["border"],
+              command=_refresh_btn_cmd).pack(side="right", padx=4, pady=6)
+
+    # ── Info strip ────────────────────────────────────────────────────────────
+    info = tk.Frame(win, bg="#050c1a", pady=4)
+    info.pack(fill="x", padx=1)
+    tk.Label(info,
+             text='  💡  Tell VinX: "open blender" · "i-launch spotify" · "buksan mo ang notepad"',
+             bg="#050c1a", fg=C["dim"], font=("Segoe UI", 8)).pack(side="left")
+
+    # ── List ──────────────────────────────────────────────────────────────────
+    body = tk.Frame(win, bg=C["win_bg"])
+    body.pack(fill="both", expand=True, padx=1)
+
+    style = ttk.Style()
+    style.theme_use("clam")
+    style.configure("SA.Treeview",
+                    background="#080f1f", foreground=C["text"],
+                    fieldbackground="#080f1f", rowheight=24,
+                    font=("Segoe UI", 9))
+    style.configure("SA.Treeview.Heading",
+                    background=C["panel"], foreground=C["dim"],
+                    font=("Segoe UI", 9, "bold"))
+    style.map("SA.Treeview", background=[("selected", C["accent"])])
+
+    tree = ttk.Treeview(body, style="SA.Treeview",
+                        columns=("path",), show="tree headings", selectmode="browse")
+    tree.heading("#0",    text="App Name")
+    tree.heading("path",  text="Path")
+    tree.column("#0",     width=200, stretch=False)
+    tree.column("path",   width=440, stretch=True)
+
+    vsb = tk.Scrollbar(body, orient="vertical",   command=tree.yview, bg=C["panel"])
+    hsb = tk.Scrollbar(body, orient="horizontal", command=tree.xview, bg=C["panel"])
+    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    vsb.pack(side="right",  fill="y")
+    hsb.pack(side="bottom", fill="x")
+    tree.pack(fill="both", expand=True)
+
+    # ── Status + Launch bar ───────────────────────────────────────────────────
+    bot = tk.Frame(win, bg=C["panel"], height=36)
+    bot.pack(fill="x", padx=1, pady=(0,1)); bot.pack_propagate(False)
+
+    status_var = tk.StringVar(value="  Loading apps…")
+    tk.Label(bot, textvariable=status_var, bg=C["panel"], fg=C["dim"],
+             font=("Segoe UI", 8), anchor="w").pack(side="left", fill="both", expand=True, padx=6)
+
+    def _launch_selected():
+        sel = tree.selection()
+        if not sel:
+            return
+        name = tree.item(sel[0], "text").strip()
+        path = _all_apps.get(name)
+        if path and _OK:
+            vinx_sysapps.launch(path)
+            status_var.set(f"  Launched: {name}")
+            lucy_log("SYSAPPS", f"Launched {name}")
+
+    tk.Button(bot, text="▶  Launch", bg=C["accent"], fg="white",
+              font=FONT_SM, relief="flat", bd=0, padx=14,
+              activebackground=C["accent2"],
+              command=_launch_selected).pack(side="right", padx=6, pady=4)
+
+    # ── Double-click to launch ────────────────────────────────────────────────
+    tree.bind("<Double-Button-1>", lambda e: _launch_selected())
+
+    # ── Search filter ─────────────────────────────────────────────────────────
+    def _filter(*_):
+        q = search_var.get().lower().strip()
+        tree.delete(*tree.get_children())
+        count = 0
+        for name, path in sorted(_all_apps.items()):
+            if q and q not in name and q not in path.lower():
+                continue
+            tree.insert("", "end", text=f"  {name}", values=(path,))
+            count += 1
+        status_var.set(f"  {count} apps" + (f" matching '{q}'" if q else " found"))
+
+    search_var.trace_add("write", _filter)
+
+    # ── Scan ──────────────────────────────────────────────────────────────────
+    def _do_scan(force=False):
+        if not _OK:
+            win.after(0, lambda: status_var.set("  vinx_sysapps not found — check LLM folder"))
+            return
+        apps = vinx_sysapps.scan(force=force)
+        _all_apps.clear()
+        _all_apps.update(apps)
+        win.after(0, _filter)
+
+    threading.Thread(target=_do_scan, daemon=True).start()
+    lucy_log("SYSAPPS", "sysApps opened")

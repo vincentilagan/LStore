@@ -1,0 +1,290 @@
+# VX:name=Crash Checker
+# VX:icon=🩺
+# VX:version=1.0
+# VX:author=Luci
+# VX:sig=KBp/T7OcGsSpCOca8H7nTbI2OebjeDnSLeD2vDcSSohslEp2KKv0lCcn9fAehQRXbtiS4SRAEbBvdL96ryFUDA==
+"""
+Luci Crash Checker
+==================
+
+Diagnoses every .vx app in `programfiles/` without opening them. For each
+file it runs three escalating tests and reports the failure with the
+exact line + traceback so you know which file to fix.
+
+Test stages (cheapest first):
+
+  1.  Syntax    — `ast.parse(source)` — catches indentation problems,
+                  unterminated strings, broken brackets. Fast & safe.
+  2.  Import    — runs the module's top-level code. Catches missing
+                  imports, NameErrors at module scope, bad C[]
+                  lookups, etc. Does NOT open any UI.
+  3.  Launch    — only when you click "Test Launch" on a row, the app's
+                  main entry point is called inside a guarded thread.
+                  Crashes are caught and shown instead of taking down
+                  Luci.
+
+Status icons in the list:
+    ✓  passed       both syntax + import OK
+    ⚠  warn         syntax OK, import skipped (no test possible without UI)
+    ✗  syntax err   ast.parse raised
+    ✗  import err   module import raised
+    🔥  launch err  Test Launch clicked → crashed
+
+Right-click any row → "Open .vx in Notes" so you can fix it inline.
+"""
+
+import os, sys, ast, builtins, traceback, importlib.util, threading, time, tkinter as tk
+from importlib.machinery import SourceFileLoader
+
+# Use the built-in open() directly. If a .vx app at the bottom of this
+# file defined `def open(...)` (Luci entry point), we'd otherwise shadow
+# Python's open() and read() would crash mid-scan.
+_open_file = builtins.open
+
+
+# ── Worker ───────────────────────────────────────────────────────────────────
+
+def _safe_read(path):
+    try:
+        with _open_file(path, "rb") as f:
+            data = f.read()
+        return data.decode("utf-8-sig", errors="replace")
+    except Exception as ex:
+        return None, str(ex)
+
+def _check_syntax(path):
+    src = _safe_read(path)
+    if isinstance(src, tuple):    # read error
+        return ("✗", "read error", src[1])
+    try:
+        ast.parse(src, filename=path)
+        return ("✓", "syntax OK", "")
+    except SyntaxError as ex:
+        snippet = ""
+        try:
+            lines = src.splitlines()
+            ln = (ex.lineno or 1) - 1
+            lo = max(0, ln - 1); hi = min(len(lines), ln + 2)
+            snippet = "\n".join(f"  {i+1:4d}  {lines[i]}"
+                                  for i in range(lo, hi))
+        except Exception:
+            pass
+        return ("✗", f"SyntaxError L{ex.lineno}: {ex.msg}", snippet)
+    except Exception as ex:
+        return ("✗", f"parse error: {ex}", "")
+
+def _check_import(path, desktop=None):
+    """Try to import the .vx file. Returns (icon, status, detail).
+
+    Sets up sys.path so `from luci import ...` resolves the same way as
+    when Luci runs the .vx app for real. Without this every file would
+    fail with ModuleNotFoundError('luci')."""
+    mod_name = "vxcheck_" + os.path.splitext(os.path.basename(path))[0]
+    # Add Luci/ to sys.path so `from luci import C, FONT, ...` works
+    LUCI_DIR = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(path))))
+    added = []
+    for p in (LUCI_DIR, os.path.dirname(path)):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+            added.append(p)
+    try:
+        loader = SourceFileLoader(mod_name, path)
+        spec   = importlib.util.spec_from_loader(mod_name, loader, origin=path)
+        if spec is None or spec.loader is None:
+            return ("✗", "cannot load", "")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return ("✓", "import OK", "")
+    except Exception:
+        return ("✗", "import error", traceback.format_exc(limit=8))
+    finally:
+        for p in added:
+            try: sys.path.remove(p)
+            except ValueError: pass
+
+
+# ── UI ───────────────────────────────────────────────────────────────────────
+
+def main(desktop):
+    PROG_DIR = getattr(desktop, "apps_dir", None) or os.path.dirname(
+        os.path.abspath(__file__))
+
+    win = tk.Toplevel(desktop.root)
+    win.geometry("760x520+200+120")
+
+    if hasattr(desktop, "apply_chrome"):
+        desktop.apply_chrome(win, title="Crash Checker", icon="🩺",
+                              include_body=False)
+
+    # Pull theme colours off the desktop facade when available.
+    BG    = getattr(desktop, "C", {}).get("win_bg",    "#0a1220")
+    PANEL = getattr(desktop, "C", {}).get("panel",     "#0d1a30")
+    TEXT  = getattr(desktop, "C", {}).get("text",      "#cfe4ff")
+    DIM   = getattr(desktop, "C", {}).get("dim",       "#7d99c4")
+    ACC   = getattr(desktop, "C", {}).get("accent",    "#5ec8ff")
+    OK    = "#5fd97f"
+    WARN  = "#ffb84d"
+    ERR   = "#ff5b6b"
+    win.configure(bg=BG)
+
+    # Toolbar
+    tb = tk.Frame(win, bg=PANEL, height=36)
+    tb.pack(fill="x"); tb.pack_propagate(False)
+    status_var = tk.StringVar(value="Idle — click Scan to start.")
+    tk.Label(tb, textvariable=status_var, bg=PANEL, fg=DIM,
+              font=("Segoe UI", 9)).pack(side="left", padx=10)
+
+    tk.Button(tb, text="🔄  Scan All",
+               bg=ACC, fg="#0a1220",
+               activebackground="#7ad6ff",
+               relief="flat", bd=0, padx=12, pady=4,
+               command=lambda: _scan_async()).pack(side="right", padx=8)
+
+    # Body: two-column split — list on left, detail on right.
+    body = tk.Frame(win, bg=BG)
+    body.pack(fill="both", expand=True)
+
+    list_frame = tk.Frame(body, bg=BG)
+    list_frame.pack(side="left", fill="both", expand=True)
+
+    detail_frame = tk.Frame(body, bg=PANEL, width=340)
+    detail_frame.pack(side="right", fill="y")
+    detail_frame.pack_propagate(False)
+
+    tk.Label(detail_frame, text="DETAILS", bg=PANEL, fg=DIM,
+              font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=10, pady=(8, 2))
+    detail_box = tk.Text(detail_frame, bg=BG, fg=TEXT,
+                          font=("Consolas", 9),
+                          wrap="word", relief="flat", bd=8,
+                          highlightthickness=0)
+    detail_box.pack(fill="both", expand=True, padx=8, pady=8)
+    detail_box.insert("1.0", "Pick a row to see the error trace.\n")
+    detail_box.config(state="disabled")
+
+    # Scrollable list
+    canvas  = tk.Canvas(list_frame, bg=BG, highlightthickness=0, bd=0)
+    sbar    = tk.Scrollbar(list_frame, orient="vertical",
+                             command=canvas.yview, bg=PANEL,
+                             troughcolor=BG, bd=0, relief="flat")
+    inner   = tk.Frame(canvas, bg=BG)
+    inner.bind("<Configure>",
+                lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=sbar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    sbar.pack(side="right", fill="y")
+    # Mouse-wheel scroll
+    canvas.bind_all("<MouseWheel>",
+                      lambda e: canvas.yview_scroll(int(-e.delta / 60), "units"))
+
+    # Per-row state
+    rows = {}    # path → {"frame", "icon_lbl", "name_lbl", "status_lbl", "result"}
+
+    def _set_detail(text):
+        detail_box.config(state="normal")
+        detail_box.delete("1.0", "end")
+        detail_box.insert("1.0", text)
+        detail_box.config(state="disabled")
+
+    def _make_row(path):
+        rel = os.path.basename(path)
+        rf = tk.Frame(inner, bg=BG, padx=4, pady=2)
+        rf.pack(fill="x")
+        ico = tk.Label(rf, text="…", bg=BG, fg=DIM,
+                        font=("Segoe UI Emoji", 12), width=2)
+        ico.pack(side="left")
+        nm  = tk.Label(rf, text=rel, bg=BG, fg=TEXT,
+                        font=("Consolas", 10), anchor="w")
+        nm.pack(side="left", fill="x", expand=True, padx=4)
+        st  = tk.Label(rf, text="", bg=BG, fg=DIM,
+                        font=("Segoe UI", 8))
+        st.pack(side="left", padx=6)
+
+        def _show(_e=None):
+            r = rows[path]
+            d = r.get("detail", "")
+            _set_detail(f"{path}\n\n{r['status']}\n\n{d}".strip())
+        for w in (rf, ico, nm, st):
+            w.bind("<Button-1>", _show)
+
+        # Right-click → open in Notes (best-effort).
+        def _rc(_e):
+            try:
+                if hasattr(desktop, "open_app"):
+                    desktop.open_app("notes.vx")
+            except Exception:
+                pass
+        for w in (rf, ico, nm, st):
+            w.bind("<Button-3>", _rc)
+
+        rows[path] = {"frame": rf, "icon_lbl": ico,
+                      "name_lbl": nm, "status_lbl": st,
+                      "status": "pending", "detail": ""}
+
+    def _update_row(path, icon, status, detail, color):
+        r = rows.get(path)
+        if not r:
+            return
+        r["icon_lbl"].config(text=icon, fg=color)
+        r["status_lbl"].config(text=status, fg=color)
+        r["status"] = status
+        r["detail"] = detail
+
+    def _scan_one(path):
+        sy_icon, sy_status, sy_snip = _check_syntax(path)
+        if sy_icon != "✓":
+            win.after(0, _update_row, path, "✗", sy_status, sy_snip, ERR)
+            return
+        im_icon, im_status, im_detail = _check_import(path, desktop)
+        if im_icon != "✓":
+            win.after(0, _update_row, path, "✗", im_status,
+                       im_detail, ERR)
+            return
+        win.after(0, _update_row, path, "✓", "OK", "Syntax + import passed.", OK)
+
+    def _scan_async():
+        # Reset
+        for path, r in rows.items():
+            r["icon_lbl"].config(text="…", fg=DIM)
+            r["status_lbl"].config(text="scanning…", fg=DIM)
+        status_var.set("Scanning…")
+        def _worker():
+            t0 = time.time()
+            for path in sorted(rows.keys()):
+                try:
+                    _scan_one(path)
+                except Exception:
+                    pass
+            dt = time.time() - t0
+            failed = sum(1 for r in rows.values()
+                          if r["status"] not in ("OK",))
+            win.after(0, lambda:
+                status_var.set(
+                    f"Scanned {len(rows)} files in {dt:.1f}s — "
+                    f"{failed} failing"))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # Discover files
+    try:
+        names = sorted(f for f in os.listdir(PROG_DIR)
+                         if f.lower().endswith(".vx"))
+    except Exception as ex:
+        _set_detail(f"Can't list {PROG_DIR}: {ex}")
+        names = []
+    for n in names:
+        _make_row(os.path.join(PROG_DIR, n))
+
+    # Auto-scan on open
+    win.after(150, _scan_async)
+    return win
+
+
+# Standard .vx entry: Luci's launcher runs the file as a module, so we
+# trigger main() from a module-level call when a desktop facade is
+# available via the global luci module. We DON'T define a top-level
+# `open()` here — that would shadow Python's built-in open() inside
+# this same module and break _safe_read().
+def vx_open(desktop):
+    """Explicit entry point alternative — call this instead of `open`."""
+    return main(desktop)

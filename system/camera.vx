@@ -1,0 +1,899 @@
+# VX:name=Camera
+# VX:icon=📷
+# VX:version=1.0
+# VX:sig=RVtWW+2Y6eRNTb+JlnbdhocBHDCv3RiPjMlb5RwlugGPyfCpldm/G97xvV9fXCpUE768bq/aMfEqv4wU/de0DQ==
+"""
+Luci Camera
+===========
+
+The Luci camera app — live preview, snapshots, recordings, and a
+small computer-vision feed VinX can subscribe to.
+
+Tracking modes (cycle via the toolbar):
+  • Preview         — raw frames, no overlay
+  • Face detect     — boxes around every detected face
+  • Face track      — locks onto the largest face, follows it
+  • Face recognize  — LBPH model trained from snapshots you save as
+                      "Enroll" → labels known faces in the feed
+  • Hand track      — skin-tone + contour heuristic, no ML model
+                      required (works on the laptop's CPU alone)
+  • Body detect     — HOG person descriptor
+
+VinX bridge:
+  Every frame writes detection metadata to /tmp/luci-vision.json so
+  VinX can react ("I see you", "two people now", "hand wave").
+
+Dependencies (FreeBSD):
+  pkg install multimedia/webcamd  (USB webcam node)
+  pkg install py311-opencv         (cv2 + Haar + LBPH)
+  service webcamd enable && service webcamd start
+
+If those aren't installed yet the app opens a setup panel with the
+commands ready to copy. No errors, no crash — just a clear path
+forward.
+"""
+
+import os, sys, time, json, subprocess, threading
+from importlib.machinery import SourceFileLoader
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_app = SourceFileLoader(
+    "luci_app",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                  "app.vx")).load_module()
+LuciWindow = _app.LuciWindow
+
+from PyQt5.QtCore    import Qt, QTimer, QSize
+from PyQt5.QtGui     import (QImage, QPixmap, QPainter, QColor,
+                              QPen, QFont)
+from PyQt5.QtWidgets import (QLabel, QHBoxLayout, QVBoxLayout,
+                              QPushButton, QFileDialog,
+                              QApplication, QFrame, QWidget,
+                              QLineEdit)
+
+
+# Where snapshots / recordings / face-recognition data live.
+_PIC_DIR = os.path.expanduser("~/Pictures/Camera")
+_VID_DIR = os.path.expanduser("~/Videos/Camera")
+_FACE_DB = os.path.expanduser("~/.config/luci/faces")     # enrolled
+                                                            # faces
+                                                            # per label
+for _d in (_PIC_DIR, _VID_DIR, _FACE_DB):
+    try: os.makedirs(_d, exist_ok=True)
+    except Exception: pass
+
+# IPC file VinX (or any other .vx) can poll for live detections.
+_VINX_FEED = "/tmp/luci-vision.json"
+
+
+# ── Optional dependency probe ──────────────────────────────────────
+def _check_deps():
+    """Return (cv2_module_or_None, /dev/video_path_or_None,
+    list_of_missing_pkgs)."""
+    missing = []
+    try:
+        import cv2 as _cv2
+    except Exception:
+        _cv2 = None
+        missing.append("py311-opencv")
+    dev = None
+    for cand in ("/dev/video0", "/dev/video1", "/dev/video2"):
+        if os.path.exists(cand):
+            dev = cand; break
+    if dev is None:
+        # webcamd installed?
+        try:
+            r = subprocess.run(["which", "webcamd"],
+                                capture_output=True, text=True,
+                                timeout=2)
+            if not r.stdout.strip():
+                missing.append("multimedia/webcamd")
+        except Exception:
+            missing.append("multimedia/webcamd")
+    return _cv2, dev, missing
+
+
+# ── Setup panel (shown when deps missing) ──────────────────────────
+class _SetupView(QWidget):
+    def __init__(self, missing, parent_window):
+        super().__init__()
+        self._win = parent_window
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 16, 20, 20)
+        lay.setSpacing(12)
+
+        title = QLabel("Camera setup required")
+        title.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        title.setStyleSheet("color: #cfe4ff;")
+        lay.addWidget(title)
+
+        msg = QLabel(
+            "Luci's camera needs these packages to access your webcam "
+            "and run vision tasks. Open a Terminal and paste:")
+        msg.setStyleSheet("color: #7d99c4;")
+        msg.setWordWrap(True)
+        lay.addWidget(msg)
+
+        cmd_lines = []
+        if "multimedia/webcamd" in missing:
+            cmd_lines += [
+                "sudo pkg install -y multimedia/webcamd",
+                "sudo sysrc cuse_load=YES",
+                "sudo kldload cuse",
+                "sudo sysrc webcamd_enable=YES",
+                "sudo service webcamd start",
+            ]
+        if "py311-opencv" in missing:
+            cmd_lines += [
+                "sudo pkg install -y py311-opencv",
+            ]
+        cmd_text = "\n".join(cmd_lines)
+
+        box = QLineEdit(cmd_text.replace("\n", " ; "))
+        box.setReadOnly(True)
+        box.setStyleSheet(
+            "QLineEdit { background: rgba(6,16,30,200);"
+            " color: #cfe4ff; border: 1px solid rgba(255,255,255,30);"
+            " border-radius: 6px; padding: 8px; font-family: monospace; }")
+        lay.addWidget(box)
+
+        copy = QPushButton("📋  Copy to clipboard")
+        copy.setStyleSheet(
+            "QPushButton { background: rgba(76,141,255,180);"
+            " color: white; border-radius: 6px; padding: 8px 14px;}"
+            "QPushButton:hover { background: rgba(76,141,255,230); }")
+        copy.clicked.connect(
+            lambda: QApplication.clipboard().setText(cmd_text))
+        lay.addWidget(copy, alignment=Qt.AlignLeft)
+
+        retry = QPushButton("🔄  Retry detection")
+        retry.setStyleSheet(copy.styleSheet())
+        retry.clicked.connect(
+            lambda: parent_window._rebuild_body())
+        lay.addWidget(retry, alignment=Qt.AlignLeft)
+
+        lay.addStretch()
+
+
+# ── Live camera view ───────────────────────────────────────────────
+class _CameraView(QWidget):
+    """Captures frames in a background thread, runs the selected
+    vision pipeline, paints the result, publishes detections to
+    /tmp/luci-vision.json for VinX."""
+
+    MODES = [
+        ("Preview",          "preview"),
+        ("Face detect",      "face_detect"),
+        ("Face track",       "face_track"),
+        ("Face recognise",   "face_rec"),
+        ("Hand track",       "hand_track"),
+        ("Body detect",      "body_detect"),
+    ]
+
+    def __init__(self, cv2_mod, dev, parent_window):
+        super().__init__()
+        self._cv2  = cv2_mod
+        self._dev  = dev
+        self._win  = parent_window
+        self._mode = "preview"
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
+        self._stop = False
+        self._cap  = None
+        # Recording state
+        self._recording   = False
+        self._video_writer = None
+        # Cached classifiers — loaded lazily on first use of each mode
+        self._face_haar     = None
+        self._hog           = None
+        self._face_rec      = None
+        self._face_tracker  = None
+        self._track_box     = None     # (x,y,w,h) for face_track
+
+        self._build_ui()
+        self._start_capture()
+
+    # ── UI ────────────────────────────────────────────────────────
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(8)
+
+        # Preview frame
+        self._preview = QLabel("Starting camera…")
+        self._preview.setAlignment(Qt.AlignCenter)
+        self._preview.setMinimumSize(640, 360)
+        self._preview.setStyleSheet(
+            "background: #000; color: #7d99c4;"
+            "border: 1px solid rgba(255,255,255,30);"
+            "border-radius: 8px;")
+        outer.addWidget(self._preview, stretch=1)
+
+        # Mode toolbar
+        bar = QHBoxLayout(); bar.setSpacing(4)
+        for label, key in self.MODES:
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setChecked(key == self._mode)
+            b.setStyleSheet(
+                "QPushButton {"
+                " background: rgba(13,26,46,180); color: #cfe4ff;"
+                " border: 1px solid rgba(255,255,255,30);"
+                " border-radius: 5px; padding: 6px 10px; }"
+                "QPushButton:checked {"
+                " background: rgba(76,141,255,200); color: white;"
+                " border-color: #4c8dff; }"
+                "QPushButton:hover { background: rgba(30,46,88,200); }")
+            b.clicked.connect(lambda _ch, k=key, btn=b:
+                                self._set_mode(k, btn))
+            bar.addWidget(b)
+        bar.addStretch()
+        outer.addLayout(bar)
+
+        # Actions row
+        act = QHBoxLayout(); act.setSpacing(8)
+        for txt, cb in [
+                ("📸  Snapshot", self._snapshot),
+                ("🎬  Record",   self._toggle_record),
+                ("📥  Enrol face", self._enrol_face),
+                ("🗑  Forget all", self._forget_faces),
+        ]:
+            b = QPushButton(txt)
+            b.setStyleSheet(
+                "QPushButton { background: rgba(13,26,46,180);"
+                " color: #cfe4ff; border: 1px solid rgba(255,255,255,30);"
+                " border-radius: 5px; padding: 6px 12px; }"
+                "QPushButton:hover { background: rgba(76,141,255,150); }")
+            b.clicked.connect(cb)
+            act.addWidget(b)
+            if txt.startswith("🎬"):
+                self._record_btn = b
+        act.addStretch()
+        outer.addLayout(act)
+
+        self._track_buttons = [
+            outer.itemAt(1).itemAt(i).widget()
+            for i in range(outer.itemAt(1).count() - 1)]
+
+        # Repaint timer
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._render_frame)
+        self._timer.start(33)         # ≈ 30 fps repaint cap
+
+    # ── Capture thread ────────────────────────────────────────────
+    def _start_capture(self):
+        # Do the actual VideoCapture inside the worker thread —
+        # OpenCV's GStreamer backend on FreeBSD spends several
+        # seconds trying to negotiate before falling back to V4L2.
+        # If we did that on the GUI thread, the camera window would
+        # appear "frozen / never opens" until the probe timed out.
+        t = threading.Thread(target=self._grab_loop, daemon=True)
+        t.start()
+
+    def _open_capture(self):
+        """Try the V4L2 backend first (the right one on FreeBSD via
+        webcamd's cuse bridge), then fall through to the auto-picker
+        if that fails. Returns the opened cv2.VideoCapture or None."""
+        cv2 = self._cv2
+        for backend in (getattr(cv2, "CAP_V4L2", 200), cv2.CAP_ANY):
+            try:
+                cap = cv2.VideoCapture(self._dev, backend)
+                if cap is not None and cap.isOpened():
+                    try:
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+                    except Exception: pass
+                    return cap
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
+        return None
+
+    def _grab_loop(self):
+        cv2 = self._cv2
+        self._cap = self._open_capture()
+        if self._cap is None:
+            # Surface the failure on the GUI thread (Qt slot
+            # invocation via QTimer.singleShot keeps it safe).
+            try:
+                QTimer.singleShot(0, lambda: self._preview.setText(
+                    f"Couldn't open {self._dev}.\n"
+                    "Is webcamd running? `service webcamd status`"))
+            except Exception: pass
+            return
+        while not self._stop:
+            try:
+                ok, frame = self._cap.read()
+                if not ok:
+                    time.sleep(0.05); continue
+            except Exception:
+                time.sleep(0.1); continue
+            # Process per mode
+            try:
+                out, detections = self._process(frame)
+            except Exception:
+                out, detections = frame, {}
+            # Recording sink
+            if self._recording and self._video_writer is not None:
+                try: self._video_writer.write(out)
+                except Exception: pass
+            with self._frame_lock:
+                self._latest_frame = out
+            # Publish detections so VinX (or any subscriber) can
+            # consume the stream without owning the camera.
+            try:
+                detections["timestamp"] = time.time()
+                detections["mode"]      = self._mode
+                tmp = _VINX_FEED + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(detections, f)
+                os.replace(tmp, _VINX_FEED)
+            except Exception: pass
+
+            # VinX-initiated enrolment: if vinx_camera.remember_name_
+            # for_current_face("Vincent") was called (from the chat
+            # worker), it drops a /tmp/luci-camera-enrol.json request
+            # for us to process. We capture the current largest face
+            # and save it under that name, then remove the request so
+            # VinX knows the enrolment succeeded.
+            self._serve_vinx_enrol_request(frame)
+
+    def _serve_vinx_enrol_request(self, frame):
+        req_path = "/tmp/luci-camera-enrol.json"
+        try:
+            if not os.path.isfile(req_path):
+                return
+            with open(req_path, "r", encoding="utf-8") as f:
+                req = json.load(f)
+            name = (req.get("name") or "").strip().replace(" ", "_")
+            if not name:
+                os.remove(req_path); return
+            cv2 = self._cv2
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = list(self._haar().detectMultiScale(
+                gray, 1.2, 5, minSize=(80, 80)))
+            if not faces:
+                # Leave the request file alone for a couple seconds so
+                # VinX's wait-loop keeps polling; the next frame might
+                # actually have a face. Time-out is enforced on VinX's
+                # side (2 s wait).
+                return
+            faces.sort(key=lambda b: b[2] * b[3], reverse=True)
+            x, y, w, h = faces[0]
+            crop = cv2.resize(gray[y:y+h, x:x+w], (160, 160))
+            idx = 0
+            while True:
+                path = os.path.join(_FACE_DB,
+                                     f"{name}_{idx:03d}.png")
+                if not os.path.exists(path): break
+                idx += 1
+            cv2.imwrite(path, crop)
+            # Recogniser invalidated — next face_rec entry rebuilds.
+            self._face_rec = None
+            self._face_rec_ready = False
+            os.remove(req_path)
+        except Exception:
+            try: os.remove(req_path)
+            except Exception: pass
+
+    def stop(self):
+        self._stop = True
+        try:
+            if self._cap is not None: self._cap.release()
+        except Exception: pass
+        try:
+            if self._video_writer is not None:
+                self._video_writer.release()
+        except Exception: pass
+        try: os.remove(_VINX_FEED)
+        except FileNotFoundError: pass
+
+    # ── Processing per mode ──────────────────────────────────────
+    def _haar(self):
+        """Lazy-load the frontal-face Haar cascade. cv2.data is absent
+        in FreeBSD's opencv build, so we probe a list of plausible
+        install paths instead of relying on the attribute."""
+        cv2 = self._cv2
+        if self._face_haar is not None:
+            return self._face_haar
+        candidates = []
+        try:
+            candidates.append(cv2.data.haarcascades)
+        except Exception: pass
+        candidates += [
+            "/usr/local/share/opencv4/haarcascades/",
+            "/usr/share/opencv4/haarcascades/",
+            "/usr/local/share/OpenCV/haarcascades/",
+        ]
+        for base in candidates:
+            p = os.path.join(base or "",
+                              "haarcascade_frontalface_default.xml")
+            if os.path.isfile(p):
+                self._face_haar = cv2.CascadeClassifier(p)
+                return self._face_haar
+        # Sentinel — caller treats None as "no detector available"
+        self._face_haar = cv2.CascadeClassifier()  # empty, never matches
+        return self._face_haar
+
+    def _hog_get(self):
+        cv2 = self._cv2
+        if self._hog is None:
+            self._hog = cv2.HOGDescriptor()
+            self._hog.setSVMDetector(
+                cv2.HOGDescriptor_getDefaultPeopleDetector())
+        return self._hog
+
+    def _face_rec_get(self):
+        cv2 = self._cv2
+        if self._face_rec is None:
+            try:
+                self._face_rec = cv2.face.LBPHFaceRecognizer_create()
+                # Load existing enrolments if any
+                self._face_labels = []
+                samples, labels = [], []
+                for fn in sorted(os.listdir(_FACE_DB)):
+                    p = os.path.join(_FACE_DB, fn)
+                    if not fn.endswith(".png"): continue
+                    name = fn.rsplit("_", 1)[0]
+                    if name not in self._face_labels:
+                        self._face_labels.append(name)
+                    img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+                    if img is None: continue
+                    samples.append(img)
+                    labels.append(self._face_labels.index(name))
+                import numpy as _np
+                if samples:
+                    self._face_rec.train(samples, _np.array(labels))
+                    self._face_rec_ready = True
+                else:
+                    self._face_rec_ready = False
+            except Exception:
+                self._face_rec = "no-face-module"
+        return self._face_rec
+
+    def _process(self, frame):
+        cv2 = self._cv2
+        det = {}
+        if self._mode == "preview":
+            return frame, det
+        if self._mode == "face_detect":
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self._haar().detectMultiScale(
+                gray, scaleFactor=1.2, minNeighbors=5,
+                minSize=(60, 60))
+            det["faces"] = [list(map(int, f)) for f in faces]
+            for (x, y, w, h) in faces:
+                cv2.rectangle(frame, (x, y), (x+w, y+h),
+                               (0, 200, 255), 2)
+            return frame, det
+        if self._mode == "face_track":
+            if self._track_box is None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = list(self._haar().detectMultiScale(
+                    gray, 1.2, 5, minSize=(60, 60)))
+                if faces:
+                    # Largest face
+                    faces.sort(key=lambda b: b[2] * b[3], reverse=True)
+                    self._track_box = tuple(map(int, faces[0]))
+                    try:
+                        self._face_tracker = cv2.legacy.TrackerCSRT_create()
+                    except Exception:
+                        try: self._face_tracker = cv2.TrackerKCF_create()
+                        except Exception: self._face_tracker = None
+                    if self._face_tracker is not None:
+                        self._face_tracker.init(frame, self._track_box)
+            else:
+                if self._face_tracker is not None:
+                    ok, box = self._face_tracker.update(frame)
+                    if ok:
+                        self._track_box = tuple(map(int, box))
+                    else:
+                        self._track_box = None
+            if self._track_box is not None:
+                x, y, w, h = self._track_box
+                det["face_track"] = [int(x), int(y), int(w), int(h)]
+                cv2.rectangle(frame, (x, y), (x+w, y+h),
+                               (76, 255, 130), 2)
+                cv2.putText(frame, "tracking",
+                             (x, max(20, y - 6)),
+                             cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                             (76, 255, 130), 2)
+            return frame, det
+        if self._mode == "face_rec":
+            rec = self._face_rec_get()
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self._haar().detectMultiScale(
+                gray, 1.2, 5, minSize=(80, 80))
+            names = []
+            for (x, y, w, h) in faces:
+                cv2.rectangle(frame, (x, y), (x+w, y+h),
+                               (255, 180, 60), 2)
+                label = "?"
+                if rec != "no-face-module" \
+                        and getattr(self, "_face_rec_ready", False):
+                    try:
+                        idx, conf = rec.predict(
+                            cv2.resize(gray[y:y+h, x:x+w],
+                                        (160, 160)))
+                        # LBPH confidence: lower is better. ~< 70 ≈ a
+                        # solid match for our enrolment workflow.
+                        if conf < 75:
+                            label = self._face_labels[idx]
+                            names.append(label)
+                    except Exception: pass
+                cv2.putText(frame, label, (x, max(20, y - 6)),
+                             cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                             (255, 220, 120), 2)
+            det["faces_recognised"] = names
+            return frame, det
+        if self._mode == "hand_track":
+            # Skeleton-style hand pose using contour geometry.
+            #
+            # Pipeline:
+            #   1. Skin-tone mask in YCrCb space (illumination-robust).
+            #   2. Largest two contours (left + right hand candidates).
+            #   3. For each contour:
+            #         palm centroid       = image moments
+            #         convex hull         = outer silhouette polygon
+            #         convexity defects   = valleys between fingers
+            #         fingertips          = hull vertices adjacent to
+            #                                deep defects (cluster &
+            #                                cap at 5 per hand)
+            #         "bones"             = lines palm-centroid → tip
+            #   4. L / R classification by frame side (camera is
+            #      mirrored so the hand on the left of frame is the
+            #      user's RIGHT hand and vice-versa).
+            #
+            # Pure CPU, no model download. Less anatomical than
+            # MediaPipe but it draws skeletons that move in real time.
+            import numpy as _np
+            ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+            mask  = cv2.inRange(ycrcb, (0, 135, 85), (255, 180, 135))
+            mask  = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                                       _np.ones((5, 5), _np.uint8))
+            mask  = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                                       _np.ones((9, 9), _np.uint8))
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                         cv2.CHAIN_APPROX_SIMPLE)
+            cnts = [c for c in cnts if cv2.contourArea(c) > 4000]
+            cnts.sort(key=cv2.contourArea, reverse=True)
+            cnts = cnts[:2]   # at most 2 hands
+
+            FW = frame.shape[1]
+            hands_out = []
+            BONE   = (110, 220, 255)   # cyan-blue
+            TIP    = (90,  255, 130)   # green dots on fingertips
+            PALM   = (255, 200, 80)    # amber palm centre
+            LABEL  = (255, 255, 255)
+
+            for c in cnts:
+                # Palm centroid via image moments.
+                M = cv2.moments(c)
+                if M["m00"] == 0: continue
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+
+                hull_idx = cv2.convexHull(c, returnPoints=False)
+                if hull_idx is None or len(hull_idx) < 4:
+                    continue
+                try:
+                    defects = cv2.convexityDefects(c, hull_idx)
+                except Exception:
+                    defects = None
+
+                fingertips = []
+                if defects is not None:
+                    for d in defects[:, 0]:
+                        s, e, _f, depth = d
+                        # depth is 256× fixed-point pixels.
+                        if depth < 8000:    # ignore shallow noise
+                            continue
+                        for idx in (s, e):
+                            pt = tuple(c[idx][0])
+                            # Keep only points clearly above palm
+                            # (fingertips point upward in our frame
+                            # convention; if user tilts a hand the
+                            # constraint still mostly holds).
+                            if pt[1] >= cy + 10:
+                                continue
+                            fingertips.append(pt)
+
+                # Cluster nearby points so 1 fingertip isn't counted
+                # twice (start + end of adjacent defects can both
+                # land on the same finger).
+                merged = []
+                for pt in fingertips:
+                    if all((px - pt[0]) ** 2 + (py - pt[1]) ** 2 > 28*28
+                            for px, py in merged):
+                        merged.append(pt)
+                # Cap at the most-distal 5 (humans have five fingers)
+                merged.sort(
+                    key=lambda p: (p[0]-cx)**2 + (p[1]-cy)**2,
+                    reverse=True)
+                merged = merged[:5]
+
+                # Side label — camera image is mirrored, so a hand
+                # whose centroid is on the LEFT half of the frame is
+                # the user's RIGHT hand.
+                side = "R" if cx < FW // 2 else "L"
+                hands_out.append({
+                    "side":   side,
+                    "palm":   [cx, cy],
+                    "tips":   [[int(p[0]), int(p[1])] for p in merged],
+                    "finger_count": len(merged),
+                })
+
+                # ── Draw the skeleton ──────────────────────────────
+                # Palm centre
+                cv2.circle(frame, (cx, cy), 7, PALM, -1)
+                cv2.circle(frame, (cx, cy), 12, PALM, 2)
+                # Bones + fingertip dots
+                for (tx, ty) in merged:
+                    cv2.line(frame, (cx, cy), (tx, ty), BONE, 2)
+                    cv2.circle(frame, (tx, ty), 6, TIP, -1)
+                    cv2.circle(frame, (tx, ty), 9, TIP, 1)
+                # Side label above palm
+                cv2.putText(frame, f"{side}  ({len(merged)})",
+                             (cx - 28, cy + 36),
+                             cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                             LABEL, 2)
+
+            det["hands"] = hands_out
+            return frame, det
+        if self._mode == "body_detect":
+            hog = self._hog_get()
+            rects, _ = hog.detectMultiScale(
+                frame, winStride=(8, 8), padding=(8, 8), scale=1.05)
+            det["bodies"] = [list(map(int, r)) for r in rects]
+            for (x, y, w, h) in rects:
+                cv2.rectangle(frame, (x, y), (x+w, y+h),
+                               (255, 120, 120), 2)
+            return frame, det
+        return frame, det
+
+    # ── UI events ─────────────────────────────────────────────────
+    def _set_mode(self, key, btn):
+        self._mode      = key
+        self._track_box = None
+        self._face_tracker = None
+        for b in self._track_buttons:
+            if b is None: continue
+            try: b.setChecked(b is btn)
+            except Exception: pass
+
+    def _render_frame(self):
+        with self._frame_lock:
+            f = self._latest_frame
+            if f is None: return
+            import numpy as _np
+            rgb = f[..., ::-1].copy()       # BGR → RGB
+        h, w, _ = rgb.shape
+        img = QImage(rgb.tobytes(), w, h, w*3, QImage.Format_RGB888)
+        pm  = QPixmap.fromImage(img).scaled(
+            self._preview.size(), Qt.KeepAspectRatio,
+            Qt.SmoothTransformation)
+        self._preview.setPixmap(pm)
+
+    def _snapshot(self):
+        try:
+            with self._frame_lock:
+                f = self._latest_frame
+            if f is None: return
+            path = os.path.join(
+                _PIC_DIR, time.strftime("snap-%Y%m%d-%H%M%S.png"))
+            self._cv2.imwrite(path, f)
+            self._flash_status(f"Saved → {os.path.basename(path)}")
+        except Exception as ex:
+            try: self._flash_status(f"Snapshot error: {ex}")
+            except Exception: pass
+
+    def _toggle_record(self):
+        try:
+            cv2 = self._cv2
+            if self._recording:
+                self._recording = False
+                try: self._video_writer.release()
+                except Exception: pass
+                self._video_writer = None
+                self._record_btn.setText("🎬  Record")
+                return
+            with self._frame_lock:
+                f = self._latest_frame
+            if f is None: return
+            h, w, _ = f.shape
+            path = os.path.join(
+                _VID_DIR, time.strftime("rec-%Y%m%d-%H%M%S.mp4"))
+            self._video_writer = cv2.VideoWriter(
+                path, cv2.VideoWriter_fourcc(*"mp4v"), 25, (w, h))
+            self._recording = True
+            self._record_btn.setText("⏹  Stop")
+        except Exception as ex:
+            self._video_writer = None
+            try: self._flash_status(f"Record error: {ex}")
+            except Exception: pass
+
+    def _enrol_face(self):
+        """Capture the largest detected face from the current frame
+        and stash it. Then surface a small INLINE name row below the
+        preview (NOT QInputDialog — that's a modal popup which on
+        Luci's no-WM frameless-fullscreen setup has been observed to
+        wedge the X server / crash the whole desktop).
+
+        Whole body wrapped in try/except so any unexpected failure
+        ends with a toast and a logged note, not a Luci death."""
+        try:
+            with self._frame_lock:
+                f = self._latest_frame
+            if f is None:
+                return
+            cv2 = self._cv2
+            gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+            faces = list(self._haar().detectMultiScale(
+                gray, 1.2, 5, minSize=(80, 80)))
+            if not faces:
+                self._flash_status(
+                    "No face detected — face the camera and try again.")
+                return
+            faces.sort(key=lambda b: b[2] * b[3], reverse=True)
+            x, y, w, h = faces[0]
+            self._pending_crop = cv2.resize(
+                gray[y:y+h, x:x+w], (160, 160))
+            self._show_enrol_row()
+        except Exception as ex:
+            try: self._flash_status(f"Enrol error: {ex}")
+            except Exception: pass
+
+    def _show_enrol_row(self):
+        """Inline row under the preview: 'Name: [____] [Save] [Cancel]'.
+        Built once, then shown/hidden — cheaper than recreating."""
+        if getattr(self, "_enrol_row", None) is None:
+            row = QFrame()
+            row.setStyleSheet(
+                "background: rgba(13,26,46,220);"
+                "border: 1px solid #4c8dff; border-radius: 6px;")
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(10, 6, 10, 6)
+            rl.setSpacing(8)
+            lbl = QLabel("Name:")
+            lbl.setStyleSheet("color: #cfe4ff;")
+            rl.addWidget(lbl)
+            self._enrol_edit = QLineEdit()
+            self._enrol_edit.setStyleSheet(
+                "QLineEdit { background: rgba(6,16,30,200);"
+                " color: #cfe4ff; border: 1px solid"
+                " rgba(255,255,255,40); border-radius: 4px;"
+                " padding: 4px 8px; }")
+            self._enrol_edit.returnPressed.connect(self._save_enrol)
+            rl.addWidget(self._enrol_edit, stretch=1)
+            save = QPushButton("Save")
+            save.setStyleSheet(
+                "QPushButton { background: rgba(76,141,255,200);"
+                " color: white; border-radius: 4px;"
+                " padding: 5px 14px; }")
+            save.clicked.connect(self._save_enrol)
+            rl.addWidget(save)
+            cancel = QPushButton("Cancel")
+            cancel.setStyleSheet(
+                "QPushButton { background: rgba(120,30,30,180);"
+                " color: white; border-radius: 4px;"
+                " padding: 5px 14px; }")
+            cancel.clicked.connect(self._hide_enrol_row)
+            rl.addWidget(cancel)
+            self._enrol_row = row
+            # Insert as the LAST widget in our outer layout, just
+            # above the actions row.
+            self.layout().addWidget(row)
+        self._enrol_edit.setText("")
+        self._enrol_row.show()
+        self._enrol_edit.setFocus()
+
+    def _hide_enrol_row(self):
+        if getattr(self, "_enrol_row", None) is not None:
+            self._enrol_row.hide()
+        self._pending_crop = None
+
+    def _save_enrol(self):
+        try:
+            crop = getattr(self, "_pending_crop", None)
+            if crop is None:
+                self._hide_enrol_row()
+                return
+            name = self._enrol_edit.text().strip().replace(" ", "_")
+            if not name:
+                self._flash_status("Please type a name.")
+                return
+            idx = 0
+            while True:
+                path = os.path.join(_FACE_DB,
+                                     f"{name}_{idx:03d}.png")
+                if not os.path.exists(path): break
+                idx += 1
+            self._cv2.imwrite(path, crop)
+            self._face_rec = None
+            self._face_rec_ready = False
+            self._flash_status(f"Saved face → {name}_{idx:03d}.png")
+            self._hide_enrol_row()
+        except Exception as ex:
+            try: self._flash_status(f"Save error: {ex}")
+            except Exception: pass
+
+    def _flash_status(self, msg):
+        """Tiny ephemeral status line on the preview itself. Avoids
+        QMessageBox / QDialog (both have wedged Luci on a no-WM X
+        session in past sessions)."""
+        if getattr(self, "_status_lbl", None) is None:
+            self._status_lbl = QLabel(self._preview)
+            self._status_lbl.setStyleSheet(
+                "background: rgba(8,16,32,220); color: #cfe4ff;"
+                "padding: 6px 12px; border-radius: 6px;"
+                "border: 1px solid rgba(255,255,255,30);")
+        self._status_lbl.setText(msg)
+        self._status_lbl.adjustSize()
+        # Bottom-centre of the preview
+        pw, ph = self._preview.width(), self._preview.height()
+        sw, sh = self._status_lbl.width(), self._status_lbl.height()
+        self._status_lbl.move((pw - sw)//2, ph - sh - 16)
+        self._status_lbl.show()
+        QTimer.singleShot(2500, self._status_lbl.hide)
+
+    def _forget_faces(self):
+        try:
+            for fn in os.listdir(_FACE_DB):
+                try: os.remove(os.path.join(_FACE_DB, fn))
+                except Exception: pass
+            self._face_rec = None
+            self._face_rec_ready = False
+            self._flash_status("All enrolled faces forgotten.")
+        except Exception as ex:
+            try: self._flash_status(f"Forget error: {ex}")
+            except Exception: pass
+
+
+# ── Top-level window ──────────────────────────────────────────────
+class CameraApp(LuciWindow):
+    TITLE = "Camera"
+    ICON  = "📷"
+    SIZE  = (820, 560)
+
+    def __init__(self, desktop=None):
+        super().__init__(desktop)
+        self._view = None
+
+    def build_body(self, lay):
+        self._lay = lay
+        self._rebuild_body()
+
+    def _rebuild_body(self):
+        # Wipe existing children of the layout
+        while self._lay.count():
+            it = self._lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                if isinstance(w, _CameraView):
+                    try: w.stop()
+                    except Exception: pass
+                w.deleteLater()
+        cv2_mod, dev, missing = _check_deps()
+        if missing or cv2_mod is None or dev is None:
+            self._lay.addWidget(_SetupView(missing, self))
+            self._view = None
+            return
+        self._view = _CameraView(cv2_mod, dev, self)
+        self._lay.addWidget(self._view, stretch=1)
+
+    def closeEvent(self, e):
+        if self._view is not None:
+            try: self._view.stop()
+            except Exception: pass
+        super().closeEvent(e)
+
+
+def main(desktop=None):
+    w = CameraApp(desktop); w.show(); return w
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    main(None)
+    sys.exit(app.exec_())

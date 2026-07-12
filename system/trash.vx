@@ -1,0 +1,21 @@
+# VX:name=Trash
+# VX:icon=🗑
+# VX:version=1.0
+# VX:sig=aDGQ9weS5e0sTl+Oz7swF+Jr5xmoZ6pg07fYMn1cWt2Zikz0XRsiYiIYjtuJax2JK/vkZ9WSfeXBV2bR24qWAA==
+"""Luci Trash — opens Files pointed at the user's .trash folder."""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from luci import FileManager, ROOT_DIR
+
+
+def main(desktop=None):
+    if desktop is None:
+        return None
+    trash_dir = os.path.join(ROOT_DIR, ".trash")
+    os.makedirs(trash_dir, exist_ok=True)
+    fm = FileManager(desktop)
+    try:
+        fm._load(trash_dir)
+    except Exception:
+        pass
+    return fm

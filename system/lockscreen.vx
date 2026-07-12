@@ -1,0 +1,179 @@
+# VX:name=Lock Screen
+# VX:icon=🔒
+# VX:version=1.0
+# VX:sig=Aag+p/wgA0dOCs1V4npue3FlsJXqwNMPXHbB2BSjU+Y3y5kMt0HQ3pi2AeT2Ql4GWLxLNC5boQB1H/4mCE2fBQ==
+"""
+Luci Lock Screen — full-screen overlay that gates input until the user
+enters their password.
+
+This is the local equivalent of macOS lock / Windows Win+L. The window
+covers the entire display, grabs all keyboard + mouse events, and
+verifies the password against the system shadow file via `su -m luci`.
+
+On FreeBSD the user is "luci" (created by provision.sh). On Windows we
+fall back to comparing against a saved hash in .user/lockpass.txt.
+Setting that password the first time is done via the unlock dialog
+itself — the first unlock sets the hash, every subsequent unlock checks.
+"""
+
+import os, sys, time, hashlib, subprocess, tkinter as tk
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from luci import C, FONT, FONT_BOLD, FONT_TITLE, ROOT_DIR
+
+_PASS_FILE = os.path.join(ROOT_DIR, ".user", "lockpass.txt")
+_IS_WIN    = sys.platform.startswith("win")
+
+
+def _hash(pw: str) -> str:
+    return hashlib.sha256(pw.encode("utf-8")).hexdigest()
+
+
+def _saved_hash() -> str:
+    try:
+        with open(_PASS_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _save_hash(pw: str):
+    try:
+        os.makedirs(os.path.dirname(_PASS_FILE), exist_ok=True)
+        with open(_PASS_FILE, "w", encoding="utf-8") as f:
+            f.write(_hash(pw))
+        try: os.chmod(_PASS_FILE, 0o600)
+        except Exception: pass
+    except Exception:
+        pass
+
+
+def _verify_unix_password(pw: str) -> bool:
+    """On FreeBSD/Linux, ask `su -c true luci` non-interactively. If the
+    password is correct, returns 0. Falls back to local hash check if
+    `su` isn't available."""
+    try:
+        proc = subprocess.run(
+            ["su", "-m", "luci", "-c", "true"],
+            input=pw + "\n",
+            capture_output=True, text=True, timeout=5,
+        )
+        return proc.returncode == 0
+    except Exception:
+        # Fallback to saved hash
+        return _saved_hash() == _hash(pw)
+
+
+def main(desktop):
+    win = tk.Toplevel(desktop.root)
+    win.overrideredirect(True)
+    # Fullscreen, modal, always-on-top
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    win.geometry(f"{sw}x{sh}+0+0")
+    try: win.attributes("-topmost", True)
+    except Exception: pass
+    try: win.attributes("-fullscreen", True)
+    except Exception: pass
+    win.configure(bg="#050810")
+
+    # Capture all input
+    try:
+        win.grab_set()
+    except Exception:
+        pass
+
+    # ── Visuals ────────────────────────────────────────────────────────
+    BG    = "#050810"
+    PANEL = "#0d1428"
+    TEXT  = "#cfe4ff"
+    DIM   = "#7d99c4"
+    ACC   = C.get("accent", "#5ec8ff")
+    ERR   = "#ff5b6b"
+
+    # Centred card
+    card = tk.Frame(win, bg=PANEL, padx=40, pady=36,
+                     highlightbackground="#1f2d4a", highlightthickness=1)
+    card.place(relx=0.5, rely=0.5, anchor="center")
+
+    tk.Label(card, text="🔒", bg=PANEL, fg=ACC,
+             font=("Segoe UI Emoji", 36)).pack(pady=(0, 6))
+    tk.Label(card, text="Luci is locked", bg=PANEL, fg=TEXT,
+             font=("Segoe UI", 18, "bold")).pack()
+    tk.Label(card, text="Enter your password to continue.",
+             bg=PANEL, fg=DIM, font=("Segoe UI", 10)).pack(pady=(2, 14))
+
+    # Clock display
+    clock_var = tk.StringVar()
+    tk.Label(card, textvariable=clock_var, bg=PANEL, fg=DIM,
+             font=("Segoe UI", 11)).pack()
+    def _tick():
+        clock_var.set(time.strftime("%a %b %d  %I:%M %p"))
+        win.after(1000, _tick)
+    _tick()
+
+    # Password entry
+    pw_var = tk.StringVar()
+    entry = tk.Entry(card, textvariable=pw_var, show="•",
+                     bg=BG, fg=TEXT, insertbackground=TEXT,
+                     font=("Segoe UI", 13), relief="flat", bd=10,
+                     width=24,
+                     highlightthickness=1, highlightcolor=ACC,
+                     highlightbackground="#1f2d4a")
+    entry.pack(pady=(18, 8))
+    entry.focus_force()
+
+    err_var = tk.StringVar()
+    tk.Label(card, textvariable=err_var, bg=PANEL, fg=ERR,
+             font=("Segoe UI", 9)).pack()
+
+    attempts = {"count": 0, "block_until": 0}
+
+    def _unlock(_e=None):
+        if time.time() < attempts["block_until"]:
+            err_var.set("Too many attempts — wait a moment.")
+            return
+        pw = pw_var.get()
+        if not pw:
+            return
+        # First-run path: no saved hash yet → set this password as the lock
+        if not _saved_hash() and (_IS_WIN or not os.path.exists("/etc/master.passwd")):
+            _save_hash(pw)
+            pw_var.set("")
+            err_var.set("Password set — locking enabled.")
+            return
+        ok = False
+        if _IS_WIN:
+            ok = _saved_hash() == _hash(pw)
+        else:
+            ok = _verify_unix_password(pw)
+        if ok:
+            try: win.grab_release()
+            except Exception: pass
+            try: win.destroy()
+            except Exception: pass
+            return
+        attempts["count"] += 1
+        pw_var.set("")
+        if attempts["count"] >= 3:
+            attempts["block_until"] = time.time() + 5
+            err_var.set("Wrong — wait 5s before next attempt.")
+        else:
+            err_var.set("Incorrect password.")
+
+    entry.bind("<Return>", _unlock)
+
+    tk.Button(card, text="Unlock", bg=ACC, fg="#0a1220",
+              activebackground="#7ad6ff",
+              relief="flat", bd=0, padx=22, pady=8,
+              font=("Segoe UI", 11, "bold"),
+              command=_unlock).pack(pady=(12, 0))
+
+    # Block Alt+F4 / Escape — only password unlocks
+    def _swallow(_e=None): return "break"
+    win.bind("<Escape>", _swallow)
+    win.bind("<Alt-F4>", _swallow)
+    win.protocol("WM_DELETE_WINDOW", lambda: None)
+
+    win.lift()
+    return win

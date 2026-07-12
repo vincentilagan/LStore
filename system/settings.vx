@@ -1,0 +1,288 @@
+# VX:name=Settings
+# VX:icon=⚙
+# VX:sig=bCs+oScp14ycEYxvwWo0SjC69i8Cpv4ZnrxJUx2r7jsjGigyhdWVOINzrbqEuHdvK6ocQZq62HHn4FaTOz55AQ==
+"""
+Luci Settings — unified config panel
+Manages themes, startup apps, VinX model, permissions, and display.
+"""
+import os, json, tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from luci import C, FONT, FONT_SM, FONT_BOLD, FONT_TITLE, ROOT_DIR, PROG_DIR, THEMES
+
+_CFG_FILE  = os.path.join(ROOT_DIR, ".user", "settings.json")
+_PERM_FILE = os.path.join(ROOT_DIR, ".user", "app_permissions.json")
+
+def _load_cfg():
+    try:
+        if os.path.isfile(_CFG_FILE):
+            return json.load(open(_CFG_FILE, encoding="utf-8"))
+    except Exception: pass
+    return {}
+
+def _save_cfg(cfg):
+    os.makedirs(os.path.dirname(_CFG_FILE), exist_ok=True)
+    with open(_CFG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+def main(desktop):
+    win = tk.Toplevel(desktop.root)
+    win.overrideredirect(True)
+    win.configure(bg=C["win_bg"])
+    sw, sh = desktop.root.winfo_screenwidth(), desktop.root.winfo_screenheight()
+    W, H = 560, 520
+    win.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
+    win.lift()
+
+    cfg = _load_cfg()
+
+    # ── Title bar ─────────────────────────────────────────────────────────────
+    # ── Title bar (global Luci chrome) ─────────────────────────────
+    if hasattr(desktop, "apply_chrome"):
+        desktop.apply_chrome(win, title="Settings",
+                              icon="⚙", include_body=False)
+    else:
+        bar = tk.Frame(win, bg=C["win_title"], height=32)
+        bar.pack(fill="x"); bar.pack_propagate(False)
+        tk.Label(bar, text="  ⚙  Settings", bg=C["win_title"],
+                 fg=C["accent2"], font=FONT_BOLD).pack(side="left", fill="y")
+        tk.Button(bar, text="✕", bg=C["win_title"], fg=C["dim"],
+                  activebackground=C["red"], activeforeground="white",
+                  font=FONT_BOLD, relief="flat", bd=0, padx=10,
+                  command=win.destroy).pack(side="right", fill="y")
+    
+        drag = [None]
+        bar.bind("<ButtonPress-1>",  lambda e: drag.__setitem__(0, (e.x_root-win.winfo_x(), e.y_root-win.winfo_y())))
+        bar.bind("<B1-Motion>",      lambda e: win.geometry(f"+{e.x_root-drag[0][0]}+{e.y_root-drag[0][1]}") if drag[0] else None)
+
+    # ── Tabs ──────────────────────────────────────────────────────────────────
+    tab_bar   = tk.Frame(win, bg=C["panel"], height=36)
+    tab_bar.pack(fill="x"); tab_bar.pack_propagate(False)
+    content   = tk.Frame(win, bg=C["win_bg"])
+    content.pack(fill="both", expand=True)
+
+    _panels = {}
+    _tab_btns = {}
+    _active_tab = [None]
+
+    def _show_tab(name):
+        if _active_tab[0]:
+            _panels[_active_tab[0]].pack_forget()
+            _tab_btns[_active_tab[0]].config(bg=C["panel"], fg=C["dim"])
+        _panels[name].pack(fill="both", expand=True)
+        _tab_btns[name].config(bg=C["win_bg"], fg=C["accent2"])
+        _active_tab[0] = name
+
+    def _make_tab(label):
+        p = tk.Frame(content, bg=C["win_bg"])
+        _panels[label] = p
+        b = tk.Button(tab_bar, text=label, bg=C["panel"], fg=C["dim"],
+                      font=FONT_SM, relief="flat", bd=0, padx=16,
+                      command=lambda l=label: _show_tab(l))
+        b.pack(side="left", fill="y")
+        _tab_btns[label] = b
+        return p
+
+    # ── Tab: Appearance ───────────────────────────────────────────────────────
+    p_appear = _make_tab("Appearance")
+
+    tk.Label(p_appear, text="Theme", bg=C["win_bg"], fg=C["dim"],
+             font=FONT_SM).pack(anchor="w", padx=20, pady=(18, 4))
+
+    theme_frame = tk.Frame(p_appear, bg=C["win_bg"])
+    theme_frame.pack(fill="x", padx=20)
+    _theme_var = tk.StringVar(value=desktop._theme)
+
+    for i, name in enumerate(sorted(THEMES.keys())):
+        tk.Radiobutton(theme_frame, text=name.title(), variable=_theme_var,
+                       value=name, bg=C["win_bg"], fg=C["text"],
+                       selectcolor=C["panel"], activebackground=C["win_bg"],
+                       font=FONT_SM, relief="flat",
+                       command=lambda n=name: desktop._switch_theme(n)
+                       ).grid(row=i//3, column=i%3, sticky="w", padx=8, pady=2)
+
+    tk.Frame(p_appear, bg=C["border"], height=1).pack(fill="x", padx=20, pady=12)
+    tk.Label(p_appear, text="Wallpaper (image path)", bg=C["win_bg"], fg=C["dim"],
+             font=FONT_SM).pack(anchor="w", padx=20, pady=(0, 4))
+    wp_var = tk.StringVar(value=cfg.get("wallpaper", ""))
+    wp_row = tk.Frame(p_appear, bg=C["win_bg"]); wp_row.pack(fill="x", padx=20)
+    tk.Entry(wp_row, textvariable=wp_var, bg=C["border"], fg=C["text"],
+             font=FONT_SM, relief="flat", bd=0,
+             insertbackground=C["accent"]).pack(side="left", fill="x", expand=True, ipady=4)
+    def _browse_wp():
+        p = filedialog.askopenfilename(filetypes=[("Images","*.png *.jpg *.jpeg *.bmp")])
+        if p: wp_var.set(p)
+    tk.Button(wp_row, text=" Browse ", bg=C["accent"], fg="white",
+              font=FONT_SM, relief="flat", bd=0, padx=6,
+              command=_browse_wp).pack(side="left", padx=(6,0))
+
+    # ── Tab: Startup ──────────────────────────────────────────────────────────
+    p_startup = _make_tab("Startup")
+
+    tk.Label(p_startup, text="Apps to launch on desktop start",
+             bg=C["win_bg"], fg=C["dim"], font=FONT_SM).pack(anchor="w", padx=20, pady=(18,6))
+
+    list_frame = tk.Frame(p_startup, bg=C["panel"], relief="flat")
+    list_frame.pack(fill="both", expand=True, padx=20, pady=(0,8))
+
+    startup_list = tk.Listbox(list_frame, bg=C["panel"], fg=C["text"],
+                               font=FONT_SM, relief="flat", bd=0,
+                               selectbackground=C["accent"], selectforeground="white",
+                               highlightthickness=0)
+    startup_list.pack(fill="both", expand=True, padx=4, pady=4)
+
+    for app in cfg.get("startup_apps", []):
+        startup_list.insert("end", app)
+
+    btn_row = tk.Frame(p_startup, bg=C["win_bg"]); btn_row.pack(fill="x", padx=20, pady=(0,12))
+
+    def _add_startup():
+        vx_files = [f for f in os.listdir(PROG_DIR) if f.endswith(".vx")]
+        dlg = tk.Toplevel(win); dlg.title("Pick app")
+        dlg.configure(bg=C["panel"]); dlg.geometry("260x320")
+        dlg.transient(win); dlg.grab_set()
+        lb = tk.Listbox(dlg, bg=C["panel"], fg=C["text"], font=FONT_SM,
+                        relief="flat", selectbackground=C["accent"])
+        lb.pack(fill="both", expand=True, padx=8, pady=8)
+        for f in sorted(vx_files): lb.insert("end", f)
+        def _pick(_=None):
+            sel = lb.curselection()
+            if sel:
+                v = lb.get(sel[0])
+                if v not in startup_list.get(0, "end"):
+                    startup_list.insert("end", v)
+            dlg.destroy()
+        lb.bind("<Double-Button-1>", _pick)
+        tk.Button(dlg, text="Add", bg=C["accent"], fg="white",
+                  font=FONT_SM, relief="flat", bd=0, command=_pick).pack(pady=6)
+
+    def _remove_startup():
+        sel = startup_list.curselection()
+        if sel: startup_list.delete(sel[0])
+
+    tk.Button(btn_row, text="＋ Add", bg=C["accent"], fg="white",
+              font=FONT_SM, relief="flat", bd=0, padx=10, pady=4,
+              command=_add_startup).pack(side="left", padx=(0,6))
+    tk.Button(btn_row, text="－ Remove", bg=C["panel"], fg=C["text"],
+              font=FONT_SM, relief="flat", bd=0, padx=10, pady=4,
+              command=_remove_startup).pack(side="left")
+
+    # ── Tab: Permissions ──────────────────────────────────────────────────────
+    p_perms = _make_tab("Permissions")
+
+    tk.Label(p_perms, text="App control permissions",
+             bg=C["win_bg"], fg=C["dim"], font=FONT_SM).pack(anchor="w", padx=20, pady=(18,6))
+
+    perm_frame = tk.Frame(p_perms, bg=C["win_bg"])
+    perm_frame.pack(fill="both", expand=True, padx=20)
+
+    def _refresh_perms():
+        for w in perm_frame.winfo_children(): w.destroy()
+        try:
+            perms = json.load(open(_PERM_FILE, encoding="utf-8")) if os.path.isfile(_PERM_FILE) else {}
+        except Exception: perms = {}
+        if not perms:
+            tk.Label(perm_frame, text="No permissions set yet.",
+                     bg=C["win_bg"], fg=C["dim"], font=FONT_SM).pack(pady=20)
+            return
+        for app, allowed in perms.items():
+            row = tk.Frame(perm_frame, bg=C["win_bg"]); row.pack(fill="x", pady=2)
+            color = C["green"] if allowed else C["red"]
+            tk.Label(row, text=f"  {'✔' if allowed else '✕'}  {app}", bg=C["win_bg"],
+                     fg=color, font=FONT_SM, width=28, anchor="w").pack(side="left")
+            def _revoke(a=app):
+                try:
+                    p = json.load(open(_PERM_FILE, encoding="utf-8"))
+                    del p[a]
+                    json.dump(p, open(_PERM_FILE,"w"), indent=2)
+                except Exception: pass
+                _refresh_perms()
+            tk.Button(row, text="Revoke", bg=C["panel"], fg=C["dim"],
+                      font=FONT_SM, relief="flat", bd=0, padx=8,
+                      command=_revoke).pack(side="right")
+
+    _refresh_perms()
+
+    # ── Tab: VinX ─────────────────────────────────────────────────────────────
+    p_vinx = _make_tab("VinX")
+
+    def _row(parent, label):
+        f = tk.Frame(parent, bg=C["win_bg"]); f.pack(fill="x", padx=20, pady=4)
+        tk.Label(f, text=label, bg=C["win_bg"], fg=C["dim"],
+                 font=FONT_SM, width=18, anchor="w").pack(side="left")
+        return f
+
+    model_var = tk.StringVar(value=cfg.get("vinx_model", ""))
+    r = _row(p_vinx, "Model path (.gguf)")
+    tk.Entry(r, textvariable=model_var, bg=C["border"], fg=C["text"],
+             font=FONT_SM, relief="flat", bd=0,
+             insertbackground=C["accent"]).pack(side="left", fill="x", expand=True, ipady=4, padx=(0,6))
+    def _browse_model():
+        p = filedialog.askopenfilename(filetypes=[("GGUF","*.gguf"),("All","*.*")])
+        if p: model_var.set(p)
+    tk.Button(r, text="Browse", bg=C["accent"], fg="white",
+              font=FONT_SM, relief="flat", bd=0, padx=6,
+              command=_browse_model).pack(side="left")
+
+    ctx_var = tk.StringVar(value=str(cfg.get("context_size", 4096)))
+    r2 = _row(p_vinx, "Context size")
+    tk.Entry(r2, textvariable=ctx_var, bg=C["border"], fg=C["text"],
+             font=FONT_SM, relief="flat", bd=0, width=10,
+             insertbackground=C["accent"]).pack(side="left", ipady=4)
+
+    screen_var = tk.BooleanVar(value=cfg.get("screen_awareness", True))
+    f3 = tk.Frame(p_vinx, bg=C["win_bg"]); f3.pack(fill="x", padx=20, pady=8)
+    tk.Checkbutton(f3, text="Screen awareness (VinX watches screen when idle)",
+                   variable=screen_var, bg=C["win_bg"], fg=C["text"],
+                   selectcolor=C["panel"], activebackground=C["win_bg"],
+                   font=FONT_SM).pack(anchor="w")
+
+    # ── Tab: System ───────────────────────────────────────────────────────────
+    p_system = _make_tab("System")
+
+    tk.Label(p_system, text="System Information", bg=C["win_bg"],
+             fg=C["text"], font=FONT_BOLD).pack(anchor="w", padx=20, pady=(20, 4))
+    tk.Label(p_system,
+             text="A full report of this machine — OS, CPU, memory, GPU,\n"
+                  "display, storage, network, audio and battery.",
+             bg=C["win_bg"], fg=C["dim"], font=FONT_SM,
+             justify="left").pack(anchor="w", padx=20)
+
+    def _open_sysinfo():
+        try:
+            desktop.launch_vx(os.path.join(PROG_DIR, "sysinfo.vx"))
+        except Exception as e:
+            messagebox.showerror("System Information",
+                                 f"Could not open:\n{e}")
+
+    tk.Button(p_system, text="  🖥  Open System Information  ",
+              bg=C["accent"], fg="white", font=FONT_BOLD, relief="flat",
+              bd=0, padx=16, pady=8,
+              command=_open_sysinfo).pack(anchor="w", padx=20, pady=16)
+
+    tk.Label(p_system,
+             text="Tip: you can also type  sysinfo  in the terminal.",
+             bg=C["win_bg"], fg=C["dim"], font=FONT_SM).pack(anchor="w", padx=20)
+
+    # ── Save button (bottom) ──────────────────────────────────────────────────
+    bot = tk.Frame(win, bg=C["panel"], height=48); bot.pack(fill="x", side="bottom")
+    bot.pack_propagate(False)
+    status_lbl = tk.Label(bot, text="", bg=C["panel"], fg=C["green"], font=FONT_SM)
+    status_lbl.pack(side="left", padx=16)
+
+    def _save():
+        cfg["theme"]            = _theme_var.get()
+        cfg["wallpaper"]        = wp_var.get().strip()
+        cfg["startup_apps"]     = list(startup_list.get(0, "end"))
+        cfg["vinx_model"]       = model_var.get().strip()
+        cfg["screen_awareness"] = screen_var.get()
+        try: cfg["context_size"] = int(ctx_var.get())
+        except ValueError: pass
+        _save_cfg(cfg)
+        status_lbl.config(text="✔  Saved")
+        win.after(2000, lambda: status_lbl.config(text=""))
+
+    tk.Button(bot, text="  Save  ", bg=C["accent"], fg="white",
+              font=FONT_BOLD, relief="flat", bd=0, padx=16, pady=6,
+              command=_save).pack(side="right", padx=16, pady=8)
+
+    _show_tab("Appearance")

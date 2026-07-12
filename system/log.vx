@@ -1,0 +1,204 @@
+﻿# VX:name=Activity Log
+# VX:icon=📋
+# VX:version=1.0
+# VX:author=Lucy
+# VX:sig=b/F/bsLgdqIBhVoPhaThPZ1oUjTxy0XqvFp9dj9QCYOieNoA3GazcGFsqfPNXXDdSJECd7PhZ477L2QCb27BBQ==
+
+import tkinter as tk
+import sys, os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from luci import C, FONT, FONT_BOLD, FONT_SM, LOG_FILE, lucy_log
+
+CATEGORY_COLORS = {
+    "LAUNCH":   "#3ddc84",
+    "ERROR":    "#ff5555",
+    "THEME":    "#5b9fff",
+    "SYSTEM":   "#567090",
+    "SETTINGS": "#ffcc44",
+}
+
+CATEGORY_ICONS = {
+    "LAUNCH":   "▶",
+    "ERROR":    "✗",
+    "THEME":    "🎨",
+    "SYSTEM":   "⚙",
+    "SETTINGS": "⚙",
+}
+
+
+def main(desktop):
+    lucy_log("SYSTEM", "Activity Log app opened")
+
+    win = tk.Toplevel(desktop.root)
+    win.overrideredirect(True)
+    win.configure(bg=C["border"])
+
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    w, h = 720, 500
+    win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+    win.attributes("-topmost", True)
+
+    # Title bar
+    # ── Title bar (global Luci chrome) ─────────────────────────────
+    # self_count is the entry-counter label that _reload() updates after
+    # each refresh. Originally it was only created inside the legacy-
+    # chrome `else` branch, which meant the apply_chrome path (the one
+    # Luci actually uses) left `self_count` unbound — calling _reload()
+    # then crashed the whole app with "cannot access free variable
+    # 'self_count' where it is not associated with a value". We declare
+    # a no-op stub first so the variable always exists, then overwrite
+    # it with the real label in the legacy chrome path.
+    class _CountStub:
+        def config(self, **_):  pass
+    self_count = _CountStub()
+
+    if hasattr(desktop, "apply_chrome"):
+        desktop.apply_chrome(win, title="Activity Log",
+                              icon="📋", include_body=False)
+    else:
+        bar = tk.Frame(win, bg=C["win_title"], height=32)
+        bar.pack(fill="x"); bar.pack_propagate(False)
+        tk.Label(bar, text="  📋  Activity Log",
+                 bg=C["win_title"], fg=C["text"],
+                 font=FONT_BOLD).pack(side="left", fill="y")
+        self_count = tk.Label(bar, text="", bg=C["win_title"], fg=C["dim"], font=FONT_SM)
+        self_count.pack(side="left", padx=8, fill="y")
+        tk.Button(bar, text="✕", bg=C["win_title"], fg=C["dim"],
+                  activebackground=C["red"], activeforeground="white",
+                  font=FONT_BOLD, relief="flat", bd=0, padx=10,
+                  command=win.destroy).pack(side="right", fill="y")
+    
+        drag = [None]
+        bar.bind("<ButtonPress-1>", lambda e: drag.__setitem__(0, (e.x_root-win.winfo_x(), e.y_root-win.winfo_y())))
+        bar.bind("<B1-Motion>",     lambda e: win.geometry(f"+{e.x_root-drag[0][0]}+{e.y_root-drag[0][1]}") if drag[0] else None)
+
+    # Filter bar
+    fbar = tk.Frame(win, bg=C["panel"])
+    fbar.pack(fill="x", padx=1)
+    tk.Label(fbar, text="  Filter:", bg=C["panel"], fg=C["dim"], font=FONT_SM).pack(side="left", pady=4)
+
+    filter_var = tk.StringVar(value="ALL")
+    categories = ["ALL"] + list(CATEGORY_COLORS.keys())
+
+    for cat in categories:
+        col = CATEGORY_COLORS.get(cat, C["dim"])
+        rb = tk.Radiobutton(fbar, text=cat, variable=filter_var, value=cat,
+                            bg=C["panel"], fg=col,
+                            selectcolor=C["border"],
+                            activebackground=C["panel"],
+                            font=("Segoe UI", 8, "bold"),
+                            command=lambda: _reload())
+        rb.pack(side="left", padx=4, pady=4)
+
+    # Search
+    tk.Label(fbar, text="Search:", bg=C["panel"], fg=C["dim"], font=FONT_SM).pack(side="left", padx=(12,2), pady=4)
+    search_var = tk.StringVar()
+    se = tk.Entry(fbar, textvariable=search_var, bg=C["border"], fg=C["text"],
+                  font=("Consolas", 9), relief="flat", bd=3, width=20,
+                  insertbackground=C["white"])
+    se.pack(side="left", pady=4)
+    search_var.trace_add("write", lambda *_: _reload())
+
+    # Log view
+    body = tk.Frame(win, bg=C["win_bg"])
+    body.pack(fill="both", expand=True, padx=1)
+
+    sb = tk.Scrollbar(body, bg=C["border"], troughcolor=C["panel"])
+    sb.pack(side="right", fill="y")
+
+    txt = tk.Text(body, bg=C["win_bg"], fg=C["text"],
+                  font=("Consolas", 9), relief="flat", bd=8,
+                  state="disabled", wrap="none",
+                  yscrollcommand=sb.set,
+                  selectbackground=C["accent"])
+    txt.pack(fill="both", expand=True)
+    sb.config(command=txt.yview)
+
+    txt.tag_config("stamp",  foreground="#2a4060")
+    for cat, col in CATEGORY_COLORS.items():
+        txt.tag_config(cat, foreground=col)
+
+    def _reload():
+        txt.config(state="normal")
+        txt.delete("1.0", "end")
+        flt    = filter_var.get()
+        search = search_var.get().lower()
+        count  = 0
+
+        try:
+            lines = open(LOG_FILE, encoding="utf-8").readlines()
+        except FileNotFoundError:
+            txt.insert("end", "  No activity recorded yet.\n", "SYSTEM")
+            txt.config(state="disabled")
+            self_count.config(text="0 entries")
+            return
+        except Exception as ex:
+            txt.insert("end", f"  Error: {ex}\n")
+            txt.config(state="disabled")
+            return
+
+        for line in reversed(lines):
+            parts = line.strip().split("  ", 2)
+            if len(parts) < 3:
+                continue
+            stamp = parts[0]
+            cat   = parts[1].strip().upper()
+            msg   = parts[2]
+
+            if flt != "ALL" and cat != flt:
+                continue
+            if search and search not in line.lower():
+                continue
+
+            icon = CATEGORY_ICONS.get(cat, "·")
+            txt.insert("end", f"  {stamp}  ", "stamp")
+            txt.insert("end", f"{icon} {cat:<10}  ", cat)
+            txt.insert("end", f"{msg}\n")
+            count += 1
+
+        txt.config(state="disabled")
+        self_count.config(text=f"{count} entries")
+
+    _reload()
+
+    # Bottom bar
+    bot = tk.Frame(win, bg=C["panel"])
+    bot.pack(fill="x", padx=1, pady=(0,1))
+
+    tk.Label(bot, text=f"  {LOG_FILE}", bg=C["panel"], fg=C["dim"],
+             font=("Segoe UI", 8)).pack(side="left", fill="y", pady=4)
+
+    tk.Button(bot, text="🔄 Refresh", bg=C["border"], fg=C["text"],
+              font=FONT_SM, relief="flat", bd=0, padx=10, pady=4,
+              command=_reload).pack(side="right", padx=4, pady=4)
+
+    def _clear():
+        try:
+            open(LOG_FILE, "w").close()
+            lucy_log("SYSTEM", "Log cleared")
+            _reload()
+        except Exception as ex:
+            pass
+
+    tk.Button(bot, text="🗑 Clear", bg=C["border"], fg=C["red"],
+              font=FONT_SM, relief="flat", bd=0, padx=10, pady=4,
+              command=_clear).pack(side="right", padx=4, pady=4)
+
+    def _export():
+        import shutil, time as _t
+        dest = os.path.join(
+            os.path.dirname(LOG_FILE),
+            f"activity_log_{_t.strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+        try:
+            shutil.copy(LOG_FILE, dest)
+            lucy_log("SYSTEM", f"Log exported to {os.path.basename(dest)}")
+            _reload()
+        except Exception as ex:
+            pass
+
+    tk.Button(bot, text="💾 Export", bg=C["border"], fg=C["yellow"],
+              font=FONT_SM, relief="flat", bd=0, padx=10, pady=4,
+              command=_export).pack(side="right", padx=4, pady=4)

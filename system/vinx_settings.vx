@@ -1,0 +1,274 @@
+# VX:name=VinX Settings
+# VX:icon=⚙
+# VX:version=1.0
+# VX:sig=U0ruJuE3qP9XHOIy9wT+UWciKC1jmUgl+zjaGJa7ItM8VrJ1y8cdsSXlONcaO+vVnD5DLo/BdArhUKrc7s49Ag==
+"""
+VinX Settings — pick the brain VinX uses.
+
+Two engines ship with Luci's Vinx-AI folder but never had a UI:
+
+  • Local GGUF (vinx_local.py)   — offline, chat only, ~6 GB RAM
+  • API engine  (gpt_engine.py)  — talks to Claude / OpenAI / Gemini
+                                    / Groq, supports tool use (the
+                                    "create folder" behaviour the
+                                    user remembers)
+  • Turbo       (vinx_turbo.py)  — idle autonomous reasoning loop
+                                    that enriches the local skills
+                                    file from whichever brain is
+                                    active
+
+This panel is the missing right-click switch. Pick a provider,
+paste a key, toggle Turbo, hit Save. The choice persists in
+gpt_engine's own config file (memory/vinx_config.json) and the
+next ai_ask / Generate / chat call uses it automatically.
+
+NO touches to luci.py or the system. Pure .vx + sys.path injection
+into /usr/local/luci/Vinx-AI so the existing engines load.
+"""
+import os, sys, tkinter as tk
+from tkinter import messagebox
+
+_VAI = "/usr/local/luci/Vinx-AI"
+if os.path.isdir(_VAI) and _VAI not in sys.path:
+    sys.path.insert(0, _VAI)
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+try:
+    from luci import C, FONT, FONT_BOLD, FONT_SM
+except Exception:
+    C = {"win_bg":"#0d1126","panel":"#1a1f3a","text":"#e6f1ff",
+         "dim":"#7d99c4","accent":"#5ec8ff","border":"#2a3450",
+         "red":"#ff6b6b","green":"#5ed98a"}
+    FONT      = ("Segoe UI", 10)
+    FONT_BOLD = ("Segoe UI", 10, "bold")
+    FONT_SM   = ("Segoe UI", 9)
+
+# ── Engine imports (best-effort) ─────────────────────────────────────
+try:
+    import gpt_engine as gpt
+except Exception:
+    gpt = None
+try:
+    import vinx_turbo as turbo
+except Exception:
+    turbo = None
+try:
+    import vinx_local as vlocal
+except Exception:
+    vlocal = None
+
+
+PROVIDERS = [
+    ("local",     "Local GGUF (offline, chat only)",
+                  "No key needed. Uses vinX.gguf in memory/models/."),
+    ("claude",    "Claude  (Anthropic)",
+                  "Paste your sk-ant-... key."),
+    ("chatgpt",   "OpenAI  (GPT-4 / GPT-5)",
+                  "Paste your sk-proj-... key."),
+    ("gemini",    "Gemini  (Google)",
+                  "Paste your AIza... key."),
+    ("groq",      "Groq  (Llama / Mixtral, very fast)",
+                  "Paste your gsk_... key."),
+    ("deepseek",  "DeepSeek",
+                  "Paste your sk-... key."),
+]
+
+
+def _notify(title, body, kind="ok"):
+    try:
+        from importlib.machinery import SourceFileLoader
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "notification.vx")
+        if os.path.isfile(p):
+            m = SourceFileLoader("n", p).load_module()
+            m.toast(title, body, kind=kind, duration=3500)
+    except Exception: pass
+
+
+def main(desktop=None):
+    root = getattr(desktop, "root", None) if desktop else None
+    win = tk.Toplevel(root) if root else tk.Tk()
+    try: win.overrideredirect(True)
+    except Exception: pass
+    win.configure(bg=C["win_bg"])
+    W, H = 480, 540
+    sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
+    win.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
+    try: win.attributes("-topmost", True)
+    except Exception: pass
+
+    # ── Title bar ──────────────────────────────────────────────────
+    tbar = tk.Frame(win, bg=C["win_bg"])
+    tbar.pack(fill="x", padx=14, pady=(10, 6))
+    tk.Label(tbar, text="⚙  VinX Settings",
+              bg=C["win_bg"], fg=C["text"], font=FONT_BOLD
+              ).pack(side="left")
+    tk.Button(tbar, text="✕", bg=C["win_bg"], fg=C["dim"],
+               relief="flat", bd=0, font=FONT, cursor="hand2",
+               command=win.destroy).pack(side="right")
+    # Drag by title bar
+    drag = [None]
+    tbar.bind("<ButtonPress-1>",
+                lambda e: drag.__setitem__(0,
+                    (e.x_root - win.winfo_x(),
+                     e.y_root - win.winfo_y())))
+    tbar.bind("<B1-Motion>",
+                lambda e: win.geometry(
+                    f"+{e.x_root - drag[0][0]}+{e.y_root - drag[0][1]}")
+                    if drag[0] else None)
+
+    sep = tk.Frame(win, bg=C["border"], height=1); sep.pack(fill="x")
+
+    # ── Body ───────────────────────────────────────────────────────
+    body = tk.Frame(win, bg=C["win_bg"])
+    body.pack(fill="both", expand=True, padx=18, pady=12)
+
+    # Status line — which engine is currently active
+    cur_provider = "local"
+    cur_key = ""
+    if gpt is not None:
+        try: cur_provider = gpt.get_active_provider() or "local"
+        except Exception: pass
+        try: cur_key = gpt.get_api_key(cur_provider) or ""
+        except Exception: pass
+
+    status_txt = ("VinX is currently using "
+                   f"{cur_provider.upper()}"
+                   f"{'  •  key set' if cur_key else '  •  no key'}")
+    tk.Label(body, text=status_txt,
+              bg=C["win_bg"], fg=C["dim"], font=FONT_SM,
+              anchor="w").pack(fill="x", pady=(0, 12))
+
+    # Provider radio group
+    sel = tk.StringVar(value=cur_provider)
+    for pid, label, hint in PROVIDERS:
+        row = tk.Frame(body, bg=C["win_bg"])
+        row.pack(fill="x", anchor="w", pady=2)
+        tk.Radiobutton(row, text=label,
+                        variable=sel, value=pid,
+                        bg=C["win_bg"], fg=C["text"],
+                        selectcolor=C["panel"],
+                        activebackground=C["win_bg"],
+                        activeforeground=C["text"],
+                        font=FONT, cursor="hand2",
+                        anchor="w").pack(side="left")
+        tk.Label(row, text="  " + hint,
+                  bg=C["win_bg"], fg=C["dim"], font=FONT_SM
+                  ).pack(side="left")
+
+    # API key entry
+    tk.Label(body, text="API KEY  (leave blank for Local GGUF)",
+              bg=C["win_bg"], fg=C["dim"], font=FONT_SM,
+              anchor="w").pack(fill="x", pady=(14, 2))
+    key_var = tk.StringVar(value=cur_key)
+    key_entry = tk.Entry(body, textvariable=key_var,
+                          show="•", bg=C["panel"], fg=C["text"],
+                          insertbackground=C["accent"],
+                          relief="flat", bd=0, font=FONT)
+    key_entry.pack(fill="x", ipady=6)
+
+    # Show/hide toggle
+    show_var = tk.BooleanVar(value=False)
+    def _toggle_show():
+        key_entry.config(show="" if show_var.get() else "•")
+    tk.Checkbutton(body, text="show key",
+                    variable=show_var, command=_toggle_show,
+                    bg=C["win_bg"], fg=C["dim"],
+                    selectcolor=C["panel"],
+                    activebackground=C["win_bg"],
+                    activeforeground=C["text"],
+                    font=FONT_SM).pack(anchor="w", pady=(4, 10))
+
+    # Turbo toggle
+    turbo_running = False
+    try:
+        if turbo is not None and hasattr(turbo, "_running"):
+            turbo_running = bool(getattr(turbo, "_running", False))
+    except Exception: pass
+    turbo_var = tk.BooleanVar(value=turbo_running)
+    tk.Checkbutton(body,
+                    text="Enable Turbo — autonomous idle reasoning "
+                         "(learns while you're not using VinX)",
+                    variable=turbo_var,
+                    bg=C["win_bg"], fg=C["text"],
+                    selectcolor=C["panel"],
+                    activebackground=C["win_bg"],
+                    activeforeground=C["text"],
+                    font=FONT_SM, wraplength=W - 50,
+                    anchor="w", justify="left"
+                    ).pack(fill="x", pady=(6, 14))
+
+    # ── Buttons ─────────────────────────────────────────────────────
+    btnrow = tk.Frame(body, bg=C["win_bg"])
+    btnrow.pack(fill="x", pady=(8, 0))
+
+    def _save():
+        provider = sel.get()
+        key = key_var.get().strip()
+        # Local needs no key; others must have one
+        if provider != "local" and not key:
+            messagebox.showwarning(
+                "VinX Settings",
+                f"Provider {provider.upper()} needs an API key.")
+            return
+        # Persist via gpt_engine
+        if gpt is not None:
+            try:
+                if provider == "local":
+                    # gpt_engine has no "local" provider; we just
+                    # clear active_provider so vinx_local.ask
+                    # routes back to the GGUF model.
+                    try: gpt._save_config({"active_provider": ""})
+                    except Exception: pass
+                else:
+                    gpt.set_provider(provider, key)
+            except Exception as ex:
+                messagebox.showerror("VinX Settings",
+                                       f"Could not save: {ex}")
+                return
+        else:
+            messagebox.showerror("VinX Settings",
+                                   "gpt_engine.py not importable. "
+                                   "Make sure /usr/local/luci/Vinx-AI "
+                                   "is intact.")
+            return
+        # Turbo
+        if turbo is not None:
+            try:
+                if turbo_var.get():
+                    if hasattr(turbo, "start"): turbo.start()
+                else:
+                    if hasattr(turbo, "stop"): turbo.stop()
+            except Exception: pass
+        _notify("⚙  VinX Settings saved",
+                 f"Provider: {provider.upper()}" +
+                 ("  •  Turbo ON" if turbo_var.get() else ""),
+                 "ok")
+        try: win.destroy()
+        except Exception: pass
+
+    tk.Button(btnrow, text="Cancel",
+               bg=C["panel"], fg=C["text"], relief="flat", bd=0,
+               padx=18, pady=8, cursor="hand2", font=FONT,
+               command=win.destroy).pack(side="right", padx=(8, 0))
+    tk.Button(btnrow, text="Save",
+               bg=C["accent"], fg="#001020", relief="flat", bd=0,
+               padx=22, pady=8, cursor="hand2", font=FONT_BOLD,
+               command=_save).pack(side="right")
+
+    # Footer hint
+    tk.Label(body,
+              text=("Tip: right-click the 🤖 VinX icon in the dock\n"
+                    "to re-open this panel."),
+              bg=C["win_bg"], fg=C["dim"], font=FONT_SM,
+              justify="left").pack(anchor="w", pady=(14, 0))
+
+    try: key_entry.focus_set()
+    except Exception: pass
+    return win
+
+
+if __name__ == "__main__":
+    main(None)
+    try: tk._default_root.mainloop()
+    except Exception: pass

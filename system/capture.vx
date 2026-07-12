@@ -1,0 +1,268 @@
+# VX:name=Screen Capture
+# VX:icon=📷
+# VX:version=1.0
+# VX:author=Luci
+# VX:net=none
+# VX:sig=cDqylT+cip/F5D/NM3SNBBcyEOE7MEkXjWmZhNMJiE3csBIvx1ORLvdL5F8AL1xN0HYmLMO1svu6f7S/YRjGBA==
+"""
+capture.vx — Screenshot + screen recording for Luci OS.
+
+Everything routes through Cosmic
+────────────────────────────────
+Capture is a host-specific operation (the grab tool differs per OS), so
+this app NEVER calls a grabber directly. Screenshots go through
+`desktop.cosmic.hal.run_cmd([...])`, which picks the right binary for
+the host and logs the call on the Cosmic bus. Recording is spawned the
+same way and every start/stop is emitted as a `cosmic.capture.*` event,
+so the whole capture history shows up in the audit trail like any other
+system action.
+
+Tooling (FreeBSD / Luci today): ffmpeg + x11grab.
+  • Screenshot : one-frame x11grab → PNG in ~/Pictures
+  • Recording  : x11grab → H.264 (libx264, CPU only, no GPU) in ~/Videos
+The encode is CPU-only on purpose — Luci keeps the GPU free for the
+user's creative apps.
+
+UI: one Tk window off the shared root (no second Tk, no mainloop), so it
+can never freeze the desktop. Buttons: Screenshot, Record/Stop.
+"""
+
+import os
+import sys
+import time
+import subprocess
+import tkinter as tk
+
+
+# ── Save locations ─────────────────────────────────────────────────────────
+_HOME      = os.path.expanduser("~")
+_PIC_DIR   = os.path.join(_HOME, "Pictures")
+_VID_DIR   = os.path.join(_HOME, "Videos")
+for _d in (_PIC_DIR, _VID_DIR):
+    try: os.makedirs(_d, exist_ok=True)
+    except Exception: pass
+
+
+def _display():
+    return os.environ.get("DISPLAY", ":0")
+
+
+def _cosmic(desktop):
+    return getattr(desktop, "cosmic", None)
+
+
+def _emit(desktop, topic, payload):
+    """Best-effort Cosmic bus emit so capture actions are audited."""
+    c = _cosmic(desktop)
+    try:
+        if c is not None and hasattr(c, "bus"):
+            c.bus.emit(topic, payload, source="capture.vx")
+    except Exception:
+        pass
+
+
+def _screen_size(desktop):
+    try:
+        r = getattr(desktop, "root", None)
+        if r is not None:
+            return r.winfo_screenwidth(), r.winfo_screenheight()
+    except Exception:
+        pass
+    return 1920, 1080
+
+
+# ── Screenshot — single x11grab frame, via Cosmic HAL ──────────────────────
+def _screenshot(desktop, status):
+    w, h = _screen_size(desktop)
+    ts   = time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(_PIC_DIR, f"screenshot-{ts}.png")
+    argv = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "x11grab", "-video_size", f"{w}x{h}",
+            "-i", _display(), "-frames:v", "1", "-y", path]
+    _emit(desktop, "cosmic.capture.screenshot", {"path": path, "size": f"{w}x{h}"})
+    c = _cosmic(desktop)
+    rc, out = -1, ""
+    try:
+        if c is not None and hasattr(c, "hal") and hasattr(c.hal, "run_cmd"):
+            rc, out = c.hal.run_cmd(argv, timeout=20)      # ROUTED THROUGH COSMIC
+        else:
+            # Fallback only if Cosmic HAL is unavailable.
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+            rc, out = p.returncode, (p.stdout or "") + (p.stderr or "")
+    except Exception as e:
+        rc, out = -1, str(e)
+    if rc == 0 and os.path.isfile(path):
+        status.config(text=f"✓ Saved {os.path.basename(path)}", fg="#44dd88")
+        _emit(desktop, "cosmic.capture.screenshot.ok", {"path": path})
+    else:
+        status.config(text=f"✗ Failed: {out[:60]}", fg="#ff7766")
+        _emit(desktop, "cosmic.capture.screenshot.error", {"error": out[:120]})
+
+
+# ── Recording — long-running ffmpeg, start/stop, audited ───────────────────
+def _start_record(desktop, state, status, btn):
+    if state.get("proc") is not None:
+        return
+    w, h = _screen_size(desktop)
+    ts   = time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(_VID_DIR, f"recording-{ts}.mp4")
+    argv = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "x11grab", "-video_size", f"{w}x{h}",
+            "-framerate", "25", "-i", _display(),
+            # CPU-only H.264 — keeps the GPU free for the user's apps.
+            "-codec:v", "libx264", "-preset", "ultrafast",
+            "-pix_fmt", "yuv420p", "-y", path]
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+    except Exception as e:
+        status.config(text=f"✗ Record failed: {e}", fg="#ff7766")
+        return
+    state["proc"] = proc
+    state["path"] = path
+    state["t0"]   = time.time()
+    _emit(desktop, "cosmic.capture.record.start", {"path": path, "size": f"{w}x{h}"})
+    btn.config(text="⏹  Stop", bg="#aa2233")
+    status.config(text="● Recording…", fg="#ff5566")
+    _tick_timer(state, status)
+
+
+def _tick_timer(state, status):
+    if state.get("proc") is None:
+        return
+    el = int(time.time() - state.get("t0", time.time()))
+    status.config(text=f"●  Recording… {el//60:02d}:{el%60:02d}",
+                  fg="#ff5566")
+    try:
+        status.after(1000, lambda: _tick_timer(state, status))
+    except Exception:
+        pass
+
+
+def _stop_record(desktop, state, status, btn):
+    proc = state.get("proc")
+    if proc is None:
+        return
+    path = state.get("path", "")
+    # 'q' tells ffmpeg to finalise the file cleanly (writes the moov
+    # atom); terminate() is the fallback if it ignores stdin.
+    try:
+        proc.communicate(input=b"q", timeout=6)
+    except Exception:
+        try: proc.terminate(); proc.wait(timeout=4)
+        except Exception:
+            try: proc.kill()
+            except Exception: pass
+    state["proc"] = None
+    _emit(desktop, "cosmic.capture.record.stop", {"path": path})
+    btn.config(text="⏺  Record", bg="#2a6a3a")
+    if path and os.path.isfile(path):
+        status.config(text=f"✓ Saved {os.path.basename(path)}", fg="#44dd88")
+    else:
+        status.config(text="✗ Recording produced no file", fg="#ff7766")
+
+
+# ── UI ─────────────────────────────────────────────────────────────────────
+def main(desktop):
+    try:
+        _build(desktop)
+    except Exception as ex:
+        try: print(f"[capture.vx] ERROR: {ex}", file=sys.stderr)
+        except Exception: pass
+
+
+def _build(desktop):
+    root = getattr(desktop, "root", None) or getattr(desktop, "_tk_root", None)
+    if root is None:
+        return
+    win = tk.Toplevel(root)
+    win.overrideredirect(True)            # Luci draws its own chrome
+    win.configure(bg="#0d1126")
+    sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
+    w, h = 400, 250
+    win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//3}")
+    try: win.attributes("-topmost", True)
+    except Exception: pass
+
+    state = {"proc": None, "path": "", "t0": 0}
+
+    # Clean close that also stops any in-progress recording.
+    def _close():
+        if state.get("proc") is not None:
+            try: _stop_record(desktop, state, status, rec_btn)
+            except Exception: pass
+        try: win.destroy()
+        except Exception: pass
+
+    # ── Title bar with a real close button ─────────────────────────
+    if hasattr(desktop, "apply_chrome"):
+        desktop.apply_chrome(win, title="Screen Capture",
+                              icon="📷", include_body=False)
+    else:
+        bar = tk.Frame(win, bg="#11162c", height=30)
+        bar.pack(fill="x"); bar.pack_propagate(False)
+        tk.Label(bar, text="  📷  Screen Capture", bg="#11162c",
+                 fg="#ffffff", font=(_FAM, 10, "bold")).pack(side="left", fill="y")
+        tk.Button(bar, text="✕", bg="#11162c", fg="#ff8888",
+                  activebackground="#aa2233", activeforeground="white",
+                  relief="flat", bd=0, padx=12, font=(_FAM, 11, "bold"),
+                  command=_close).pack(side="right", fill="y")
+        drag = [None]
+        bar.bind("<ButtonPress-1>",
+                 lambda e: drag.__setitem__(0, (e.x_root-win.winfo_x(),
+                                                e.y_root-win.winfo_y())))
+        bar.bind("<B1-Motion>",
+                 lambda e: win.geometry(
+                     f"+{e.x_root-drag[0][0]}+{e.y_root-drag[0][1]}")
+                     if drag[0] else None)
+
+    body = tk.Frame(win, bg="#0d1126")
+    body.pack(fill="both", expand=True)
+
+    tk.Label(body, text="📷  Screen Capture", bg="#0d1126", fg="#ffffff",
+              font=(_FAM, 14, "bold")).pack(pady=(12, 2))
+    tk.Label(body, text="Routed through Cosmic · saved to Pictures / Videos",
+              bg="#0d1126", fg="#88aacc",
+              font=(_FAM, 8)).pack()
+
+    status = tk.Label(body, text="Ready", bg="#0d1126", fg="#aaccff",
+                       font=(_FAM, 10, "bold"))
+    status.pack(pady=(12, 4))
+
+    def _shot():
+        # Hide our own window so it isn't in the shot, grab, then show.
+        try: win.withdraw()
+        except Exception: pass
+        def _do():
+            _screenshot(desktop, status)
+            try: win.deiconify(); win.lift()
+            except Exception: pass
+        try: win.after(250, _do)
+        except Exception: _do()
+
+    def _toggle_record():
+        if state.get("proc") is None:
+            _start_record(desktop, state, status, rec_btn)
+        else:
+            _stop_record(desktop, state, status, rec_btn)
+
+    btnrow = tk.Frame(body, bg="#0d1126"); btnrow.pack(pady=10)
+    tk.Button(btnrow, text="📷  Screenshot", bg="#2f4a8a", fg="#ffffff",
+               relief="flat", padx=16, pady=9, font=(_FAM, 11, "bold"),
+               command=_shot).pack(side="left", padx=6)
+    rec_btn = tk.Button(btnrow, text="⏺  Record", bg="#2a6a3a", fg="#ffffff",
+                         relief="flat", padx=16, pady=9,
+                         font=(_FAM, 11, "bold"),
+                         command=_toggle_record)
+    rec_btn.pack(side="left", padx=6)
+
+    tk.Label(body, text="Tip: recording uses CPU only (GPU stays free)",
+              bg="#0d1126", fg="#5577aa",
+              font=(_FAM, 8)).pack(pady=(8, 0))
+
+    win.protocol("WM_DELETE_WINDOW", _close)
+
+
+if __name__ == "__main__":
+    main(None)

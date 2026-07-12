@@ -1,0 +1,448 @@
+# VX:name=Blackhole
+# VX:icon=⚫
+# VX:version=1.0
+# VX:net=local
+# VX:sig=KeqJDBTM1Qw3J3ebnVdmn0Rp/Z6LQnW8YJ18fwWmOmTTlxMwKc51jM9p4wbrt/RXqA85vtA/M6tjB9LtggZxBQ==
+"""
+Luci Blackhole — peer-to-peer file sharing over LAN.
+
+Concept
+=======
+  • Open Blackhole on Luci → it boots a tiny HTTP server, picks a
+    4-digit pairing code, and shows you both code + IP.
+  • On the other machine (Windows / Linux / another Luci), run
+    `blackhole-client.py` (ships in this folder). Enter the IP
+    + code → you're paired.
+  • Drag-drop files in either window; they're transferred and
+    appear in the other side's library.
+
+Protocol
+========
+  HTTP on port 7717 (chosen so it's memorable: 7717 = "blackhole-y").
+    POST /auth         body: code           → 200 + session token
+    POST /upload?tok=X multipart file       → 200 stored under inbox
+    GET  /list?tok=X                        → JSON of files
+    GET  /download/<name>?tok=X             → file bytes
+
+  Token = 16-byte hex, valid until Blackhole exits.
+  Code  = 4 random digits regenerated every launch.
+
+  No PII over the wire, no TLS yet (LAN-only). Files land in
+  ~/Downloads/Blackhole/<peer>/ on receive; Luci's Files sidebar
+  treats it like any other folder.
+"""
+
+import os, sys, json, secrets, threading, time, socket
+import http.server, http.client, urllib.parse
+from PyQt5.QtCore    import (Qt, QTimer, QRectF, QPointF,
+                              pyqtSignal, QObject)
+from PyQt5.QtGui     import (QFont, QColor, QPainter, QPen, QBrush,
+                              QPainterPath, QLinearGradient)
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                              QPushButton, QFileDialog, QApplication,
+                              QFrame, QScrollArea, QListWidget,
+                              QListWidgetItem)
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+try:
+    from luci import C, _UI_FAM
+except Exception:
+    C = {"accent":"#5ec8ff","text":"#ffffff","dim":"#7d99c4"}
+    _UI_FAM = "Segoe UI"
+
+PORT  = 7717
+INBOX = os.path.expanduser("~/Downloads/Blackhole")
+os.makedirs(INBOX, exist_ok=True)
+
+
+# ── Local IP discovery (the LAN address, not 127.0.0.1) ──────────────
+def _local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Doesn't actually connect (UDP) — just lets the kernel pick
+        # an outbound interface so we can read its address.
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+# ── HTTP server ───────────────────────────────────────────────────────
+class _Server(threading.Thread):
+    def __init__(self, code, signals):
+        super().__init__(daemon=True)
+        self._code = code
+        self._token = secrets.token_hex(8)
+        self._signals = signals
+        self._httpd = None
+        self._files_seen = set()
+
+    @property
+    def token(self): return self._token
+
+    def run(self):
+        server = self
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a, **k): pass  # quiet
+
+            def _check_tok(self):
+                q = urllib.parse.urlparse(self.path).query
+                tok = urllib.parse.parse_qs(q).get("tok", [""])[0]
+                return tok == server._token
+
+            def do_POST(self):
+                u = urllib.parse.urlparse(self.path)
+                if u.path == "/auth":
+                    ln = int(self.headers.get("Content-Length", 0))
+                    body = self.rfile.read(ln).decode("utf-8", "ignore")
+                    code = json.loads(body or "{}").get("code", "")
+                    if code == server._code:
+                        peer = self.client_address[0]
+                        server._signals.peer_connected.emit(peer)
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps(
+                            {"token": server._token}).encode())
+                    else:
+                        self.send_error(403, "bad code")
+                    return
+                if u.path == "/upload":
+                    if not self._check_tok():
+                        return self.send_error(403)
+                    # Filename from header (caller sets it)
+                    fname = self.headers.get("X-Filename", "file.bin")
+                    fname = os.path.basename(fname)
+                    peer  = self.client_address[0]
+                    pdir  = os.path.join(INBOX, peer)
+                    os.makedirs(pdir, exist_ok=True)
+                    dst = os.path.join(pdir, fname)
+                    ln = int(self.headers.get("Content-Length", 0))
+                    with open(dst, "wb") as f:
+                        remaining = ln
+                        while remaining > 0:
+                            chunk = self.rfile.read(min(65536, remaining))
+                            if not chunk: break
+                            f.write(chunk); remaining -= len(chunk)
+                    server._signals.file_received.emit(peer, fname, ln)
+                    self.send_response(200); self.end_headers()
+                    return
+                self.send_error(404)
+
+            def do_GET(self):
+                u = urllib.parse.urlparse(self.path)
+                if u.path == "/list":
+                    if not self._check_tok(): return self.send_error(403)
+                    files = []
+                    for sub in os.listdir(INBOX):
+                        d = os.path.join(INBOX, sub)
+                        if not os.path.isdir(d): continue
+                        for n in os.listdir(d):
+                            full = os.path.join(d, n)
+                            files.append({
+                                "peer": sub, "name": n,
+                                "size": os.path.getsize(full),
+                                "mtime": os.path.getmtime(full)})
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(files).encode())
+                    return
+                if u.path.startswith("/download/"):
+                    if not self._check_tok(): return self.send_error(403)
+                    name = os.path.basename(
+                        urllib.parse.unquote(u.path[len("/download/"):]))
+                    # Look in any peer subdir
+                    for sub in os.listdir(INBOX):
+                        full = os.path.join(INBOX, sub, name)
+                        if os.path.isfile(full):
+                            self.send_response(200)
+                            self.send_header(
+                                "Content-Type", "application/octet-stream")
+                            self.send_header(
+                                "Content-Length", str(os.path.getsize(full)))
+                            self.end_headers()
+                            with open(full, "rb") as f:
+                                while True:
+                                    b = f.read(65536)
+                                    if not b: break
+                                    self.wfile.write(b)
+                            return
+                    self.send_error(404)
+                    return
+                self.send_error(404)
+
+        try:
+            self._httpd = http.server.ThreadingHTTPServer(
+                ("0.0.0.0", PORT), Handler)
+            self._httpd.serve_forever()
+        except Exception as ex:
+            print("blackhole server:", ex, file=sys.stderr)
+
+    def stop(self):
+        if self._httpd:
+            try: self._httpd.shutdown()
+            except Exception: pass
+
+
+# ── Qt signals bus (server thread → UI thread) ────────────────────────
+class _Signals(QObject):
+    peer_connected = pyqtSignal(str)
+    file_received  = pyqtSignal(str, str, int)
+
+
+# ── UI ────────────────────────────────────────────────────────────────
+class BlackholePanel(QWidget):
+    def __init__(self, desktop=None):
+        # X11BypassWindowManagerHint → override-redirect, so the Luci
+        # Window Manager skips framing this app (it draws its OWN chrome).
+        super().__init__(None, Qt.FramelessWindowHint | Qt.Window
+                         | Qt.X11BypassWindowManagerHint)
+        self.resize(540, 460)
+
+        self._code  = f"{secrets.randbelow(10000):04d}"
+        self._ip    = _local_ip()
+        self._sig   = _Signals()
+        self._sig.peer_connected.connect(self._on_peer_connected)
+        self._sig.file_received.connect(self._on_file_received)
+        self._server = _Server(self._code, self._sig)
+        self._server.start()
+        self._peers = set()
+
+        self._build()
+        self._refresh_library()
+        try:
+            from PyQt5.QtGui import QGuiApplication
+            scr = QGuiApplication.primaryScreen().geometry()
+            self.move((scr.width()  - self.width())  // 2,
+                       (scr.height() - self.height()) // 2)
+        except Exception: pass
+
+        self._lib_timer = QTimer(self)
+        self._lib_timer.timeout.connect(self._refresh_library)
+        self._lib_timer.start(2500)
+
+    # ── build ───────────────────────────────────────────────────────
+    def _build(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(20, 16, 20, 16); outer.setSpacing(10)
+
+        # Header row
+        head = QHBoxLayout()
+        title = QLabel("⚫  Blackhole Sharing")
+        title.setFont(QFont(_UI_FAM, 14, QFont.Bold))
+        title.setStyleSheet("color:#ffffff;background:transparent;")
+        head.addWidget(title); head.addStretch()
+        x = QPushButton("✕"); x.setFixedSize(22, 22)
+        x.setCursor(Qt.PointingHandCursor)
+        x.setStyleSheet(
+            "QPushButton{background:transparent;color:rgba(255,255,255,180);"
+            "border:none;font-size:14px;font-weight:bold;}"
+            "QPushButton:hover{color:#ffffff;background:rgba(255,255,255,30);"
+            "border-radius:11px;}")
+        x.clicked.connect(self.close)
+        head.addWidget(x)
+        outer.addLayout(head)
+
+        # Pairing card (large IP + code)
+        card = QFrame()
+        card.setStyleSheet(
+            "background:rgba(94,200,255,18);"
+            "border:1px solid rgba(94,200,255,80);"
+            "border-radius:12px;")
+        clay = QVBoxLayout(card)
+        clay.setContentsMargins(16, 12, 16, 12); clay.setSpacing(2)
+        lbl_addr = QLabel("Address")
+        lbl_addr.setFont(QFont(_UI_FAM, 8))
+        lbl_addr.setStyleSheet(
+            f"color:{C.get('dim','#7d99c4')}; background:transparent;"
+            "letter-spacing:2px;border:none;")
+        clay.addWidget(lbl_addr)
+        self._ip_lbl = QLabel(f"{self._ip} : {PORT}")
+        self._ip_lbl.setFont(QFont(_UI_FAM, 16, QFont.Bold))
+        self._ip_lbl.setStyleSheet(
+            "color:#ffffff;background:transparent;border:none;")
+        clay.addWidget(self._ip_lbl)
+
+        spacer = QLabel("")
+        spacer.setFixedHeight(6); spacer.setStyleSheet("border:none;")
+        clay.addWidget(spacer)
+
+        lbl_code = QLabel("Pairing code")
+        lbl_code.setFont(QFont(_UI_FAM, 8))
+        lbl_code.setStyleSheet(
+            f"color:{C.get('dim','#7d99c4')}; background:transparent;"
+            "letter-spacing:2px;border:none;")
+        clay.addWidget(lbl_code)
+        self._code_lbl = QLabel("  ".join(self._code))
+        self._code_lbl.setFont(QFont(_UI_FAM, 30, QFont.Bold))
+        self._code_lbl.setStyleSheet(
+            f"color:{C.get('accent','#5ec8ff')};background:transparent;"
+            "border:none;letter-spacing:6px;")
+        clay.addWidget(self._code_lbl)
+        outer.addWidget(card)
+
+        # Peers row
+        prow = QHBoxLayout()
+        self._peers_lbl = QLabel("• 0 partners connected")
+        self._peers_lbl.setFont(QFont(_UI_FAM, 9))
+        self._peers_lbl.setStyleSheet(
+            f"color:{C.get('dim','#7d99c4')};background:transparent;")
+        prow.addWidget(self._peers_lbl); prow.addStretch()
+        send_btn = QPushButton("＋  Send a file")
+        send_btn.setFont(QFont(_UI_FAM, 9))
+        send_btn.setCursor(Qt.PointingHandCursor)
+        send_btn.setStyleSheet(
+            "QPushButton{background:rgba(94,200,255,40);color:#ffffff;"
+            "border:1px solid rgba(94,200,255,120);border-radius:6px;"
+            "padding:5px 12px;}"
+            "QPushButton:hover{background:rgba(94,200,255,80);}")
+        send_btn.clicked.connect(self._send_dialog)
+        prow.addWidget(send_btn)
+        outer.addLayout(prow)
+
+        # Divider
+        sep = QFrame(); sep.setFixedHeight(1)
+        sep.setStyleSheet("background:rgba(255,255,255,30);border:none;")
+        outer.addWidget(sep)
+
+        # Library list
+        lib_lbl = QLabel("LIBRARY")
+        lib_lbl.setFont(QFont(_UI_FAM, 7))
+        lib_lbl.setStyleSheet(
+            f"color:{C.get('dim','#7d99c4')};letter-spacing:2px;"
+            "background:transparent;")
+        outer.addWidget(lib_lbl)
+        self._lib = QListWidget()
+        self._lib.setStyleSheet(
+            "QListWidget{background:transparent;color:#ffffff;"
+            "border:none;}"
+            "QListWidget::item{padding:6px 8px;border-radius:6px;}"
+            "QListWidget::item:hover{background:rgba(255,255,255,20);}"
+            "QListWidget::item:selected{background:rgba(94,200,255,55);}")
+        outer.addWidget(self._lib, stretch=1)
+
+    # ── chrome ──────────────────────────────────────────────────────
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect().adjusted(0, 0, -1, -1)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(r), 16, 16)
+        grad = QLinearGradient(0, 0, 0, self.height())
+        grad.setColorAt(0.0, QColor(14, 26, 56, 235))
+        grad.setColorAt(1.0, QColor(6,  14, 32, 235))
+        p.fillPath(path, grad)
+        sheen = QLinearGradient(0, 0, 0, self.height() * 0.35)
+        sheen.setColorAt(0.0, QColor(255, 255, 255, 30))
+        sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.fillPath(path, sheen)
+        pen = QPen(QColor(255, 255, 255, 55)); pen.setWidth(1)
+        p.setPen(pen); p.setBrush(Qt.NoBrush); p.drawPath(path)
+
+    # ── slots ───────────────────────────────────────────────────────
+    def _on_peer_connected(self, ip):
+        if ip not in self._peers:
+            self._peers.add(ip)
+            self._peers_lbl.setText(
+                f"• {len(self._peers)} partner"
+                f"{'s' if len(self._peers) != 1 else ''} connected — {', '.join(self._peers)}")
+
+    def _on_file_received(self, peer, name, size):
+        self._refresh_library()
+
+    def _refresh_library(self):
+        self._lib.clear()
+        if not os.path.isdir(INBOX): return
+        rows = []
+        for sub in sorted(os.listdir(INBOX)):
+            d = os.path.join(INBOX, sub)
+            if not os.path.isdir(d): continue
+            for n in sorted(os.listdir(d)):
+                full = os.path.join(d, n)
+                if not os.path.isfile(full): continue
+                rows.append((sub, n, os.path.getsize(full)))
+        if not rows:
+            it = QListWidgetItem("  (no files yet — open the partner "
+                                  "client to send some)")
+            it.setForeground(QColor(C.get("dim", "#7d99c4")))
+            it.setFlags(Qt.NoItemFlags)
+            self._lib.addItem(it)
+            return
+        for peer, name, size in rows:
+            human = self._human(size)
+            it = QListWidgetItem(f"  📄  {name}     from {peer}  ·  {human}")
+            self._lib.addItem(it)
+
+    @staticmethod
+    def _human(n):
+        for u in ("B", "KB", "MB", "GB"):
+            if n < 1024: return f"{n:.0f} {u}"
+            n /= 1024
+        return f"{n:.1f} TB"
+
+    def _send_dialog(self):
+        """Sends a local file to every connected peer over /upload."""
+        if not self._peers:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Blackhole",
+                "No partners connected yet.\n"
+                "Open blackhole-client.py on the other computer.")
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Pick a file to send")
+        if not path: return
+        threading.Thread(target=self._send_worker,
+                          args=(path,), daemon=True).start()
+
+    def _send_worker(self, path):
+        # Peer-to-peer push: as the SERVER we don't talk back, so this
+        # would need each client to expose its own port. v1 keeps it
+        # pull-only: peer downloads from us instead. So "send a file"
+        # here just COPIES the chosen file into the inbox under
+        # peer = self so it appears in the shared library; partners
+        # then fetch it via /download.
+        try:
+            dst_dir = os.path.join(INBOX, "self")
+            os.makedirs(dst_dir, exist_ok=True)
+            import shutil
+            shutil.copy2(path, os.path.join(dst_dir,
+                                              os.path.basename(path)))
+            self._refresh_library()
+        except Exception as ex:
+            print("send:", ex, file=sys.stderr)
+
+    # Drag-to-move
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag = e.globalPos() - self.frameGeometry().topLeft()
+            e.accept()
+    def mouseMoveEvent(self, e):
+        if e.buttons() & Qt.LeftButton and getattr(self, "_drag", None):
+            self.move(e.globalPos() - self._drag); e.accept()
+
+    def closeEvent(self, e):
+        try: self._server.stop()
+        except Exception: pass
+        e.accept()
+
+
+def main(desktop=None):
+    panel = BlackholePanel(desktop)
+    panel.show(); panel.raise_(); panel.activateWindow()
+    if desktop is not None:
+        try:
+            if not hasattr(desktop, "_vx_qt_panels"):
+                desktop._vx_qt_panels = {}
+            desktop._vx_qt_panels.setdefault(__file__, []).append(panel)
+            if not hasattr(desktop, "_panels"): desktop._panels = []
+            desktop._panels.append(panel)
+        except Exception: pass
+    return panel
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    main(None)
+    sys.exit(app.exec_())

@@ -1,0 +1,583 @@
+# VX:name=AppTemplate
+# VX:icon=📦
+# VX:version=1.0
+# VX:sig=sIFtYHGDOdoHeykNsBmg5Uc27mV5JimiIIenOO2OKJqcA7ZxJR7opbVLOrgGGWi3EQ8LspDstBb2BPy9wsSCBg==
+"""
+Luci app template — base class for consistent Luci-style windows.
+
+Why this exists
+===============
+Up until now every .vx app rolled its own chrome: some had macOS
+traffic lights (red/yellow/green), some used the Luci hexagon
+palette (red/yellow/blue), some were fully solid, some translucent,
+some had no close button at all. Painful to look at, painful to
+maintain.
+
+This module ships one canonical LuciWindow class. New .vx apps:
+
+    from app import LuciWindow
+
+    class MyApp(LuciWindow):
+        TITLE = "Notes"
+        ICON  = "📝"
+        def build_body(self, parent_layout):
+            parent_layout.addWidget(QLabel("hello"))
+
+    def main(desktop):
+        w = MyApp(desktop)
+        w.show()
+        return w
+
+…gets, for free:
+
+  • Hexagon-shaped traffic lights in Luci's brand colours
+        🔴 red    = close
+        🟡 yellow = minimise (showMinimized)
+        🔵 blue   = maximise / restore
+  • Painted-glass chrome (gradient + sheen + 1-px border) drawn
+    in paintEvent — no compositor needed, looks the same with or
+    without picom.
+  • Frameless Qt window that's still draggable by the title bar.
+  • Optional Luci-menubar registration so the app's name + menu
+    items appear in the top bar while focused (macOS pattern that
+    nodebase.vx pioneered).
+  • Standard keyboard shortcuts (Esc / Ctrl+W close).
+
+Nothing in this module reaches into luci.py — it only USES the
+public set_app_menu API that the menubar already exposes.
+"""
+import os, sys
+from PyQt5.QtCore    import (Qt, QRectF, QPointF, QPoint, QSize,
+                              QEvent)
+from PyQt5.QtGui     import (QPainter, QPainterPath, QColor, QPen,
+                              QBrush, QFont, QLinearGradient,
+                              QPolygonF)
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                              QPushButton, QApplication, QShortcut, QSizeGrip)
+from PyQt5.QtGui     import QKeySequence
+
+
+# ── Brand palette ─────────────────────────────────────────────────────
+TRAFFIC = {
+    "close":    "#ff5f57",   # red
+    "minimize": "#febc2e",   # yellow
+    "maximize": "#4c8dff",   # Luci blue (not Apple green)
+}
+BG_GRAD_TOP    = QColor(14, 26, 56, 235)
+BG_GRAD_BOT    = QColor(6,  14, 32, 235)
+SHEEN_TOP      = QColor(255, 255, 255, 38)
+BORDER         = QColor(255, 255, 255, 55)
+TEXT           = QColor(245, 250, 255)
+DIM            = QColor(125, 153, 196)
+
+
+# ── Hexagon traffic-light button ──────────────────────────────────────
+class _HexLight(QPushButton):
+    """Small clickable hexagon with a brand colour. Replaces the
+    Apple circle so Luci's identity carries through every app."""
+
+    SIZE = 14
+
+    def __init__(self, kind):
+        super().__init__()
+        self._kind = kind
+        self._hover = False
+        self.setFixedSize(self.SIZE + 2, self.SIZE + 2)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet("background:transparent;border:none;")
+
+    def enterEvent(self, _e): self._hover = True;  self.update()
+    def leaveEvent(self, _e): self._hover = False; self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        cx, cy = self.width() / 2, self.height() / 2
+        r = self.SIZE / 2
+        # Six-sided polygon, flat-top
+        pts = []
+        import math as _m
+        for i in range(6):
+            a = (_m.pi / 3) * i
+            pts.append(QPointF(cx + r * _m.cos(a),
+                                cy + r * _m.sin(a)))
+        poly = QPolygonF(pts)
+        col = QColor(TRAFFIC[self._kind])
+        if not self._hover:
+            col.setAlpha(220)
+        p.setBrush(col)
+        p.setPen(QPen(QColor(0, 0, 0, 60), 0.5))
+        p.drawPolygon(poly)
+
+
+# ── Base window ───────────────────────────────────────────────────────
+class LuciWindow(QWidget):
+    TITLE   = "App"
+    ICON    = "📦"
+    SIZE    = (720, 480)
+    MENU    = []   # list of (label, callable) — appears in top menubar
+    # Identity shown in the topbar's "About this app" panel. Leave the
+    # defaults and Luci will fall back to the `# VX:` header values.
+    VERSION = ""
+    AUTHOR  = ""
+    ABOUT   = ""   # one-line/short description of what the app does
+
+    def __init__(self, desktop=None):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.Window)
+        self._desk = desktop
+        self.resize(*self.SIZE)
+        self._maximized = False
+        self._geo_before_max = None
+        self._drag = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+
+        # Title bar: three hex lights left, title centered
+        tbar = QWidget(); tbar.setFixedHeight(34)
+        tbar.setStyleSheet("background:transparent;")
+        tlay = QHBoxLayout(tbar)
+        tlay.setContentsMargins(12, 6, 12, 6); tlay.setSpacing(7)
+        self._b_close = _HexLight("close")
+        self._b_min   = _HexLight("minimize")
+        self._b_max   = _HexLight("maximize")
+        self._b_close.clicked.connect(self.close)
+        self._b_min.clicked.connect(self.showMinimized)
+        self._b_max.clicked.connect(self._toggle_max)
+        tlay.addWidget(self._b_close)
+        tlay.addWidget(self._b_min)
+        tlay.addWidget(self._b_max)
+        tlay.addStretch()
+        self._title_lbl = QLabel(f"{self.ICON}  {self.TITLE}")
+        self._title_lbl.setFont(QFont("Segoe UI", 9, QFont.DemiBold))
+        self._title_lbl.setStyleSheet(
+            f"color:rgba(245,250,255,200);background:transparent;")
+        tlay.addWidget(self._title_lbl)
+        tlay.addStretch()
+        # Right-side spacer matches the three buttons so title stays
+        # visually centred.
+        spacer = QWidget(); spacer.setFixedWidth(3 * (_HexLight.SIZE + 2) + 14)
+        tlay.addWidget(spacer)
+        outer.addWidget(tbar)
+        self._tbar = tbar
+
+        # Body host — subclass populates this
+        body = QWidget()
+        body.setStyleSheet("background:transparent;")
+        self._body_lay = QVBoxLayout(body)
+        self._body_lay.setContentsMargins(14, 4, 14, 14)
+        self._body_lay.setSpacing(8)
+        outer.addWidget(body, stretch=1)
+        try: self.build_body(self._body_lay)
+        except Exception: pass
+
+        # Shortcuts
+        QShortcut(QKeySequence("Esc"),     self, activated=self.close)
+        QShortcut(QKeySequence("Ctrl+W"),  self, activated=self.close)
+        QShortcut(QKeySequence("F11"),     self,
+                  activated=self._toggle_max)
+
+        # NOTE: apps do NOT push themselves onto the topbar. Luci's
+        # central focus-watcher (Luci._focus_sync) reads whichever
+        # window is active and renders its name + menu + About itself.
+        # An app only DECLARES its identity via the class attributes
+        # below (TITLE / ICON / MENU / VERSION / AUTHOR / ABOUT) plus
+        # its `# VX:` header — the topbar reads those. This keeps the
+        # template DRY: any app built from it automatically appears in
+        # the topbar and dock with zero per-app wiring.
+        #
+        # We expose the menu spec on a well-known attribute so the
+        # watcher can find it on the live window.
+        self._luci_menu_spec = list(self.MENU)
+
+        # Corner resize grips — frameless windows have no WM resize border,
+        # so without these there's no way (and no cursor hint) to resize.
+        # QSizeGrip shows the diagonal-arrow cursor on hover and drags to
+        # resize. Bottom corners only, so they never cover the titlebar
+        # traffic-lights. Minimum size keeps the window from collapsing.
+        self.setMinimumSize(300, 220)
+        self._grips = []
+        for _ in range(2):                     # bottom-left, bottom-right
+            g = QSizeGrip(self)
+            g.setFixedSize(20, 20)
+            g.setStyleSheet("background:transparent;")
+            self._grips.append(g)
+        self._position_grips()
+
+    def _position_grips(self):
+        try:
+            w, h, s = self.width(), self.height(), 20
+            self._grips[0].move(0, h - s)          # bottom-left
+            self._grips[1].move(w - s, h - s)      # bottom-right
+            for g in self._grips:
+                g.raise_()
+        except Exception:
+            pass
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._position_grips()
+
+    # Subclasses override this to fill the body
+    def build_body(self, layout):
+        pass
+
+    # ── glass chrome ─────────────────────────────────────────────────
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect().adjusted(0, 0, -1, -1)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(r), 14, 14)
+        grad = QLinearGradient(0, 0, 0, self.height())
+        grad.setColorAt(0.0, BG_GRAD_TOP)
+        grad.setColorAt(1.0, BG_GRAD_BOT)
+        p.fillPath(path, grad)
+        sheen = QLinearGradient(0, 0, 0, self.height() * 0.35)
+        sheen.setColorAt(0.0, SHEEN_TOP)
+        sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.fillPath(path, sheen)
+        pen = QPen(BORDER); pen.setWidth(1)
+        p.setPen(pen); p.setBrush(Qt.NoBrush); p.drawPath(path)
+
+    # ── window controls ─────────────────────────────────────────────
+    def _toggle_max(self):
+        try:
+            from PyQt5.QtGui import QGuiApplication
+            scr = QGuiApplication.primaryScreen().geometry()
+            if self._maximized:
+                if self._geo_before_max:
+                    self.setGeometry(self._geo_before_max)
+                self._maximized = False
+            else:
+                self._geo_before_max = self.geometry()
+                self.setGeometry(0, 26, scr.width(),
+                                  scr.height() - 26 - 84)
+                self._maximized = True
+        except Exception: pass
+
+    # ── drag by title bar ───────────────────────────────────────────
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and e.y() <= 34:
+            self._drag = e.globalPos() - self.frameGeometry().topLeft()
+            e.accept()
+    def mouseMoveEvent(self, e):
+        if e.buttons() & Qt.LeftButton and self._drag is not None:
+            self.move(e.globalPos() - self._drag); e.accept()
+    def mouseReleaseEvent(self, e):
+        self._drag = None
+
+    def closeEvent(self, e):
+        # Clear our menu from the top bar so the next focused app's
+        # menu can take over.
+        if self._desk is not None:
+            try:
+                mb = getattr(self._desk, "_menubar", None)
+                if mb is not None and hasattr(mb, "clear_app_menu"):
+                    mb.clear_app_menu()
+            except Exception: pass
+        super().closeEvent(e)
+
+
+# ──────────────────────────────────────────────────────────────────
+#  LuciNativeApp — wrapper base for SEPARATE X11 binaries.
+#
+#  Luci can't intercept the menus a native app (Blender, GIMP, Krita,
+#  Inkscape, Chromium, etc.) draws inside its own window, but it CAN:
+#    • spawn the binary and keep a handle to the subprocess,
+#    • capture the app's X window ID with xdotool right after spawn,
+#    • publish a Luci-side menu in the top bar — each MENU item is a
+#      keyboard shortcut that gets routed to the captured window via
+#      `xdotool key --window <wid> <shortcut>`.
+#
+#  Define a subclass and it Just Works:
+#
+#       class BlenderApp(LuciNativeApp):
+#           TITLE = "Blender"
+#           ICON  = "🟧"
+#           BIN   = "/usr/local/bin/blender"
+#           MENU  = [
+#               ("File → Save",    "ctrl+s"),
+#               ("File → Save As", "ctrl+shift+s"),
+#               ("Render image",   "F12"),
+#               ("Edit → Undo",    "ctrl+z"),
+#           ]
+#
+#       def main(desktop):
+#           return BlenderApp.launch(desktop)
+#
+#  The wrapper has NO Qt window of its own — it lives inside the
+#  Luci process just long enough to spawn the binary and hand the
+#  MENU to set_app_menu.
+# ──────────────────────────────────────────────────────────────────
+import subprocess, shutil, time, threading
+
+
+class LuciNativeApp:
+    BIN    = ""               # absolute path to the native binary
+    TITLE  = "App"
+    ICON   = "📦"
+    ARGS   = ()               # extra argv passed to BIN
+    MENU   = []               # list of (label, "ctrl+shift+s")
+
+    @classmethod
+    def launch(cls, desktop=None):
+        bin_ = cls.BIN if os.path.isfile(cls.BIN) \
+                       else shutil.which(os.path.basename(cls.BIN))
+        if not bin_:
+            try:
+                if desktop is not None:
+                    desktop._toast(f"{cls.TITLE} not installed.")
+            except Exception:
+                print(cls.TITLE, "not installed", file=sys.stderr)
+            return None
+
+        # ── Single-instance: if a process from a previous launch is
+        # still alive, just bring its window to the front instead
+        # of spawning a duplicate. Native apps like Blender don't
+        # cleanly support multiple instances launched in quick
+        # succession; the second silently dies and we end up with
+        # a "click did nothing" surprise.
+        # Stable per-app registry key. Luci loads .vx apps via
+        # module_from_spec()/exec_module(), which does NOT register the
+        # module in sys.modules — so `sys.modules[cls.__module__]` would
+        # KeyError (this is why every LStore native launcher failed to
+        # open from the Launchpad while the same binary ran fine from a
+        # terminal). Read __file__ off the class's own module object,
+        # falling back to the module NAME if even that is unavailable.
+        _mod = sys.modules.get(cls.__module__)
+        key = getattr(_mod, "__file__", None) or cls.__module__
+        if desktop is not None:
+            existing = list(getattr(desktop, "_vx_subprocs", {}
+                            ).get(key, []))
+            live = [p for p in existing if p.poll() is None]
+            # Tidy up the registry — drop dead procs.
+            try:
+                if hasattr(desktop, "_vx_subprocs"):
+                    desktop._vx_subprocs[key] = live
+            except Exception: pass
+            if live:
+                # Try to pop the existing window. If xdotool finds
+                # NO window for this PID the process is a zombie
+                # (Blender exited but the launcher script is still
+                # parented) — kill it and fall through to a fresh
+                # spawn so the user's click does something.
+                p = live[0]
+                xd = shutil.which("xdotool")
+                window_id = None
+                if xd:
+                    try:
+                        r = subprocess.run(
+                            [xd, "search", "--pid", str(p.pid)],
+                            capture_output=True, text=True, timeout=2)
+                        for ln in r.stdout.splitlines():
+                            ln = ln.strip()
+                            if ln.isdigit():
+                                window_id = ln; break
+                    except Exception:
+                        pass
+                if window_id:
+                    try:
+                        subprocess.Popen(
+                            [xd, "windowactivate", window_id],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+                    except Exception: pass
+                    return p
+                # Zombie path — reap the dead handle then spawn fresh.
+                try: p.kill()
+                except Exception: pass
+                try: p.wait(timeout=2)
+                except Exception: pass
+                try:
+                    desktop._vx_subprocs[key] = [
+                        x for x in desktop._vx_subprocs.get(key, [])
+                        if x is not p]
+                except Exception: pass
+
+        try:
+            # Explicit env so HOME / DISPLAY / XAUTHORITY are right
+            # for native apps. Some apps (Blender) write to
+            # ~/.cache/<app>; if HOME is wrong they spam permission
+            # errors and may silently skip their startup.
+            env = os.environ.copy()
+            env.setdefault("HOME", os.path.expanduser("~"))
+            env.setdefault("DISPLAY", ":0")
+            # Detached log so launch errors aren't lost in /dev/null.
+            log = open(f"/tmp/luci-{os.path.basename(cls.BIN)}.log",
+                        "ab")
+            proc = subprocess.Popen(
+                [bin_, *cls.ARGS],
+                stdout=log, stderr=log,
+                start_new_session=True,
+                env=env)
+        except Exception as ex:
+            try:
+                if desktop is not None:
+                    desktop._toast(f"{cls.TITLE} launch failed: {ex}")
+            except Exception:
+                pass
+            return None
+
+        # Track for the dock's running-dot.
+        if desktop is not None:
+            try:
+                if not hasattr(desktop, "_vx_subprocs"):
+                    desktop._vx_subprocs = {}
+                desktop._vx_subprocs.setdefault(key, []).append(proc)
+            except Exception:
+                pass
+
+        # Capture the window ID + publish the top-bar menu on a
+        # background thread so the launch path returns instantly.
+        def _attach():
+            wid = cls._wait_for_window(proc.pid, timeout=20)
+            if not wid:
+                return
+            if desktop is not None and cls.MENU:
+                try:
+                    mb = getattr(desktop, "_menubar", None)
+                    if mb is not None and hasattr(mb, "set_app_menu"):
+                        # Each menu item becomes a callable that pipes
+                        # the configured key sequence to the captured
+                        # X window via xdotool.
+                        items = []
+                        for label, keys in cls.MENU:
+                            def _make(_k=keys, _w=wid):
+                                def _fire():
+                                    try:
+                                        subprocess.Popen(
+                                            ["xdotool", "key",
+                                              "--window", str(_w), _k],
+                                            stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL)
+                                    except Exception: pass
+                                return _fire
+                            items.append((label, _make()))
+                        # Quit menu entry — terminates the subprocess.
+                        def _quit():
+                            try: proc.terminate()
+                            except Exception: pass
+                        items.append(("✕  Quit " + cls.TITLE, _quit))
+                        # Hand to the menubar on the GUI thread.
+                        try:
+                            from PyQt5.QtCore import QTimer
+                            QTimer.singleShot(0,
+                                lambda: mb.set_app_menu(cls.TITLE,
+                                                          items))
+                        except Exception:
+                            mb.set_app_menu(cls.TITLE, items)
+                except Exception:
+                    pass
+        threading.Thread(target=_attach, daemon=True).start()
+
+        # Crash watcher — wait for the process; if it dies abnormally,
+        # write a readable crash report (reason, likely-OOM, memory at
+        # exit, and the tail of the app's own output) and toast the user.
+        # This is Luci's crash reporter: like other OSes, but it names the
+        # cause — especially useful for out-of-memory render crashes.
+        def _watch():
+            try:
+                proc.wait()
+            except Exception:
+                return
+            rc = proc.returncode
+            if rc is None or rc == 0:
+                return
+            import signal as _sig, time as _t
+            if rc < 0:
+                try: reason = "killed by signal %s" % _sig.Signals(-rc).name
+                except Exception: reason = "killed by signal %d" % -rc
+            else:
+                reason = "exited with code %d" % rc
+            try:
+                import psutil
+                mem = psutil.virtual_memory().percent
+            except Exception:
+                mem = -1
+            oom = (mem >= 0 and mem >= 95) or (rc < 0 and -rc == 9)
+            tail = ""
+            try:
+                with open("/tmp/luci-%s.log" % os.path.basename(cls.BIN)) as f:
+                    tail = "".join(f.readlines()[-40:])
+            except Exception:
+                pass
+            cdir = os.path.join(os.path.expanduser("~"), ".config", "luci",
+                                "crashes")
+            try:
+                os.makedirs(cdir, exist_ok=True)
+                stamp = _t.strftime("%Y%m%d-%H%M%S")
+                rp = os.path.join(cdir, "%s-%s.log" % (cls.TITLE, stamp))
+                with open(rp, "w", encoding="utf-8") as f:
+                    f.write("Luci crash report\n"
+                            "  app         : %s\n"
+                            "  when        : %s\n"
+                            "  reason      : %s\n"
+                            "  memory@exit : %s%%\n"
+                            "  likely OOM  : %s\n\n"
+                            "--- last output ---\n%s\n"
+                            % (cls.TITLE, stamp, reason,
+                               ("%.0f" % mem) if mem >= 0 else "n/a",
+                               "yes" if oom else "no", tail or "(no log)"))
+            except Exception:
+                rp = ""
+            if desktop is not None:
+                if oom:
+                    msg = ("%s ran out of memory and was stopped. "
+                           "A crash report was saved." % cls.TITLE)
+                else:
+                    msg = "%s stopped unexpectedly (%s)." % (cls.TITLE, reason)
+                try:
+                    from PyQt5.QtCore import QTimer
+                    QTimer.singleShot(0, lambda: desktop._toast(msg))
+                except Exception:
+                    pass
+        threading.Thread(target=_watch, daemon=True).start()
+        return proc
+
+    # ── helpers ────────────────────────────────────────────────────
+    @staticmethod
+    def _wait_for_window(pid, timeout=20):
+        """Poll xdotool until the spawned PID has a visible window.
+        Returns the X window ID as int, or None on timeout."""
+        deadline = time.time() + timeout
+        xd = shutil.which("xdotool")
+        if not xd:
+            return None
+        while time.time() < deadline:
+            try:
+                r = subprocess.run(
+                    [xd, "search", "--pid", str(pid)],
+                    capture_output=True, text=True, timeout=2)
+                lines = [l.strip() for l in r.stdout.splitlines()
+                          if l.strip().isdigit()]
+                if lines:
+                    return int(lines[-1])
+            except Exception:
+                pass
+            time.sleep(0.25)
+        return None
+
+
+# Standalone demo if launched from the launchpad
+def main(desktop=None):
+    class _Demo(LuciWindow):
+        TITLE = "App Template"
+        ICON  = "📦"
+        MENU  = [("⬡  About",   lambda: None),
+                 ("🔁  Refresh", lambda: None)]
+        def build_body(self, lay):
+            l = QLabel("This is the Luci app template.\n"
+                       "Inherit LuciWindow to get hex traffic lights,\n"
+                       "glass chrome, menubar integration, drag, and\n"
+                       "the standard shortcuts for free.")
+            l.setStyleSheet("color:#dde6f4;background:transparent;")
+            l.setFont(QFont("Segoe UI", 10))
+            lay.addWidget(l, alignment=Qt.AlignCenter)
+    w = _Demo(desktop); w.show(); return w
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    main(None)
+    sys.exit(app.exec_())

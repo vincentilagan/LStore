@@ -1,0 +1,357 @@
+# VX:name=Bluetooth
+# VX:icon=🔵
+# VX:version=2.0
+# VX:author=Luci
+# VX:net=none
+# VX:sig=oEzf4Lwuu9fdPoZnE1ch6Kt1SU1CXalFJ7ak5YNcqjVb6vDwC/ROS+Bth54RlezqOg8Yf3E3yIV/nPrncaQKCg==
+"""
+bluetooth.vx — Luci Bluetooth panel. Same frosted-glass PyQt5 chrome as
+the Wi-Fi panel (cards, pill buttons), talking to the FreeBSD netgraph
+Bluetooth stack.
+
+How it works
+────────────
+  • The adapter's HCI node (e.g. `ubt0hci`) is created automatically once
+    ng_ubt attaches + the Realtek firmware is uploaded at boot (see
+    /usr/local/share/rtlbt-firmware). We DETECT it with `ngctl list` — we
+    do NOT run `service bluetooth start`, which tears the auto-built stack
+    back down.
+  • Scan → `hccontrol -n <node> inquiry`, then a name request per address.
+  • Connect → best-effort SDP browse / HID query (FreeBSD pairing is
+    device-type specific).
+
+Honest limitation
+─────────────────
+FreeBSD's netgraph stack is Classic (BR/EDR) only — it has no BLE scan.
+Phones advertise over BLE when you open their Bluetooth screen, so they
+won't appear here; classic gadgets (speakers, headphones, mice, keyboards,
+controllers) in pairing mode will. The panel says so instead of spinning.
+"""
+
+import os, sys, re, subprocess, time, threading
+from PyQt5.QtCore    import Qt, QTimer, pyqtSignal
+from PyQt5.QtGui     import QFont, QColor, QPainter, QPen, QBrush
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                             QListWidget, QListWidgetItem, QPushButton,
+                             QFrame, QApplication)
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+try:
+    from luci import C
+except Exception:
+    C = {"panel": "#121827", "text": "#cfe4ff", "dim": "#7d99c4",
+         "accent": "#5ec8ff", "red": "#ff5b6b", "green": "#4ade80"}
+
+
+# ── shell helper ────────────────────────────────────────────────────────────
+def _sh(argv, timeout=20, priv=True):
+    """(rc, output). hccontrol / sdpcontrol / bthidcontrol need root; luci
+    has a NOPASSWD sudoers rule for them. Direct subprocess with a hard
+    timeout + stdin=DEVNULL so the panel can never hang."""
+    if priv and not (hasattr(os, "geteuid") and os.geteuid() == 0):
+        argv = ["sudo", "-n"] + list(argv)
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=timeout, stdin=subprocess.DEVNULL)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except subprocess.TimeoutExpired:
+        return -1, "timeout"
+    except Exception as e:
+        return -1, str(e)
+
+
+# ── stack detection / scan / connect ────────────────────────────────────────
+def _hci_node():
+    """Live HCI node name (e.g. 'ubt0hci'), or '' if the Bluetooth stack
+    isn't up. ng_ubt auto-creates the node as `ubt<N>hci` — NOT a /dev/ubt
+    device (which never appears on this stack). We PROBE the conventional
+    names with `hccontrol read_bd_addr` rather than `ngctl list`, because
+    hccontrol is in luci's NOPASSWD sudoers and ngctl is not."""
+    for i in range(4):
+        node = "ubt%dhci" % i
+        rc, out = _sh(["hccontrol", "-n", node, "read_bd_addr"], timeout=5)
+        if "BD_ADDR" in out:
+            return node
+    return ""
+
+
+def _adapter_mac(node):
+    rc, out = _sh(["hccontrol", "-n", node, "read_bd_addr"], timeout=6)
+    m = re.search(r"BD_ADDR:\s*([0-9a-fA-F:]{17})", out)
+    return m.group(1) if m else ""
+
+
+def _scan(node):
+    """Classic inquiry + per-device name → list of (addr, name)."""
+    rc, out = _sh(["hccontrol", "-n", node, "inquiry"], timeout=25)
+    devices, seen = [], set()
+    for a in re.findall(r"BD_ADDR:\s*([0-9a-fA-F:]{17})", out):
+        if a in seen:
+            continue
+        seen.add(a)
+        rc2, out2 = _sh(["hccontrol", "-n", node, "remote_name_request", a],
+                        timeout=10)
+        m = re.search(r"Name:\s*(.+)", out2)
+        devices.append((a, (m.group(1).strip() if m else "") or "(unknown)"))
+    return devices
+
+
+def _connect(node, addr, name):
+    _sh(["hccontrol", "-n", node, "create_connection", addr], timeout=12)
+    rc, out = _sh(["sdpcontrol", "-a", addr, "browse"], timeout=15)
+    if rc == 0 and out.strip():
+        return True, f"Found services on {name}. Pairing depends on the device."
+    rc2, out2 = _sh(["bthidcontrol", "-a", addr, "query"], timeout=12)
+    if rc2 == 0:
+        return True, f"{name} responded to a HID query."
+    return False, f"Couldn't reach {name}."
+
+
+# ── device-type icon (mirrors the Wi-Fi _Bars widget slot) ──────────────────
+def _dev_glyph(name):
+    n = (name or "").lower()
+    if any(k in n for k in ("head", "buds", "pod", "audio", "sound", "jbl")):
+        return "🎧"
+    if any(k in n for k in ("speaker", "boom", "sound")):
+        return "🔊"
+    if "mouse" in n:      return "🖱"
+    if any(k in n for k in ("key", "board")): return "⌨"
+    if any(k in n for k in ("phone", "iphone", "galaxy", "pixel")): return "📱"
+    if any(k in n for k in ("watch", "band", "fit")): return "⌚"
+    if any(k in n for k in ("pad", "controller", "game")): return "🎮"
+    return "🔵"
+
+
+# ── Panel (same chrome recipe as WiFiPanel) ─────────────────────────────────
+class BluetoothPanel(QWidget):
+    _scan_done = pyqtSignal(object)     # list[(addr,name)]
+    _status    = pyqtSignal(str, str)   # text, color
+
+    def __init__(self, desktop=None):
+        super().__init__()
+        self._desk = desktop
+        self._node = ""
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedWidth(380)
+        self.setMinimumHeight(480)
+        self._radius = 14
+        self._scan_done.connect(self._on_scan_done)
+        self._status.connect(self._set_status)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 14, 18, 16)
+        root.setSpacing(12)
+
+        # Header: title + × close
+        head = QHBoxLayout(); head.setSpacing(6)
+        t = QLabel("Bluetooth")
+        t.setFont(QFont("Segoe UI", 12, QFont.DemiBold))
+        t.setStyleSheet("color:#ffffff;background:transparent;")
+        head.addWidget(t); head.addStretch(1)
+        x = QPushButton("×"); x.setFixedSize(20, 20)
+        x.setStyleSheet(
+            "QPushButton{background:transparent;color:rgba(255,255,255,160);"
+            "border:none;font-size:16px;font-weight:bold;}"
+            "QPushButton:hover{color:#ffffff;background:rgba(255,255,255,30);"
+            "border-radius:10px;}")
+        x.clicked.connect(self.close)
+        head.addWidget(x)
+        root.addLayout(head)
+
+        # Status pill (like Wi-Fi's status pill)
+        self._stat = QLabel("Checking adapter…")
+        self._stat.setFont(QFont("Segoe UI", 10))
+        self._stat.setAlignment(Qt.AlignCenter)
+        self._stat.setStyleSheet(
+            "background:rgba(255,255,255,18);color:#ffffff;"
+            "border:none;border-radius:10px;padding:10px 14px;")
+        root.addWidget(self._stat)
+
+        # Device list — same transparent-row styling as the Wi-Fi list
+        self._list = QListWidget()
+        self._list.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._list.viewport().setAttribute(Qt.WA_TranslucentBackground, True)
+        self._list.setFrameShape(QFrame.NoFrame)
+        self._list.setStyleSheet("""
+            QListWidget          {background: transparent; border: none;
+                                  color:#ffffff; outline: none;}
+            QListWidget::item    {background: transparent; padding: 0;
+                                  border: none;}
+            QListWidget::item:hover    {background: rgba(255,255,255,18);
+                                        border-radius: 8px;}
+            QListWidget::item:selected {background: rgba(94,200,255,55);
+                                        border-radius: 8px;}
+            QScrollBar:vertical  {background: transparent; width: 6px;}
+            QScrollBar::handle:vertical {background: rgba(255,255,255,55);
+                                         border-radius: 3px; min-height: 24px;}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0; background: none;}
+        """)
+        self._list.itemClicked.connect(self._on_pick)
+        root.addWidget(self._list, 1)
+
+        # Footer: Scan + count (mirrors Wi-Fi footer)
+        foot = QHBoxLayout()
+        self._scan_btn = QPushButton("🔍  Scan")
+        self._scan_btn.setCursor(Qt.PointingHandCursor)
+        self._scan_btn.setStyleSheet("""
+            QPushButton {background: rgba(94,200,255,180); color:#0a1220;
+                         border:none; border-radius:8px;
+                         padding:7px 22px; font-weight:600;}
+            QPushButton:hover  {background: rgba(94,200,255,220);}
+            QPushButton:pressed{background: rgba(94,200,255,255);}
+            QPushButton:disabled {background: rgba(255,255,255,30);
+                                  color: rgba(255,255,255,80);}
+        """)
+        self._scan_btn.clicked.connect(self._scan_now)
+        foot.addWidget(self._scan_btn)
+        foot.addStretch(1)
+        self._info = QLabel("")
+        self._info.setStyleSheet("color: rgba(255,255,255,140); background:transparent;")
+        foot.addWidget(self._info)
+        root.addLayout(foot)
+
+        try:
+            sg = QApplication.primaryScreen().geometry()
+            self.move(sg.width() - self.width() - 16, 32)
+        except Exception:
+            self.move(640, 40)
+
+        from PyQt5.QtWidgets import QShortcut
+        from PyQt5.QtGui     import QKeySequence
+        QShortcut(QKeySequence("Escape"), self, activated=lambda: self.close())
+
+        QTimer.singleShot(60, self._refresh_adapter)
+
+    # glass background — identical recipe to the Wi-Fi panel
+    def paintEvent(self, _):
+        from PyQt5.QtCore import QRectF
+        from PyQt5.QtGui  import QLinearGradient, QBrush, QPainterPath
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect())
+        clip = QPainterPath(); clip.addRoundedRect(r, self._radius, self._radius)
+        try:    pb = QColor(C.get("panel", "#121827"))
+        except Exception: pb = QColor(20, 28, 60)
+        pb.setAlpha(110)
+        p.fillPath(clip, pb)
+        sheen = QLinearGradient(0, 0, 0, min(90, self.height() // 3))
+        sheen.setColorAt(0, QColor(255, 255, 255, 50))
+        sheen.setColorAt(1, QColor(255, 255, 255, 0))
+        p.fillPath(clip, QBrush(sheen))
+        pen = QPen(QColor(255, 255, 255, 80)); pen.setWidth(1)
+        p.setPen(pen); p.drawPath(clip)
+        p.end()
+
+    # ── status pill ─────────────────────────────────────────────────────
+    def _set_status(self, text, color="#ffffff"):
+        bg = {"#7af0a0": "rgba(40,201,63,40)", "#ffb84a": "rgba(255,184,74,30)",
+              "#ff7766": "rgba(255,90,80,34)"}.get(color, "rgba(255,255,255,18)")
+        self._stat.setText(text)
+        self._stat.setStyleSheet(
+            f"background:{bg};color:{color};border:none;border-radius:10px;"
+            "padding:10px 14px;font-weight:600;")
+
+    def _refresh_adapter(self):
+        def work():
+            node = _hci_node()
+            self._node = node
+            try:
+                if hasattr(self._desk, "_set_bt_active"):
+                    self._desk._set_bt_active(bool(node))
+            except Exception:
+                pass
+            if node:
+                mac = _adapter_mac(node)
+                self._status.emit(f"Bluetooth on{('  ·  ' + mac) if mac else ''}",
+                                  "#7af0a0")
+            else:
+                self._status.emit("No Bluetooth adapter is ready.", "#ffb84a")
+        threading.Thread(target=work, daemon=True).start()
+
+    # ── scan ────────────────────────────────────────────────────────────
+    def _scan_now(self):
+        if not self._node:
+            self._refresh_adapter()
+            if not self._node:
+                self._set_status("No Bluetooth adapter is ready.", "#ffb84a")
+                return
+        self._scan_btn.setEnabled(False)
+        self._info.setText("Scanning…")
+        self._set_status("Scanning for nearby devices…  (~15s)", "#9fc2ff")
+        self._list.clear()
+        def work():
+            devs = _scan(self._node)
+            self._scan_done.emit(devs)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_scan_done(self, devs):
+        self._scan_btn.setEnabled(True)
+        self._list.clear()
+        if devs:
+            for a, n in devs:
+                self._add_row(a, n)
+            self._info.setText(f"{len(devs)} device(s)")
+            self._set_status(f"Found {len(devs)} device(s).", "#7af0a0")
+        else:
+            self._info.setText("0 devices")
+            # Honest guidance — the #1 reason nothing shows up is BLE phones.
+            self._set_status(
+                "No classic devices found. Phones use BLE (not scannable "
+                "here) — put a speaker/headset/mouse in PAIRING mode, or "
+                "pair FROM your phone to “luci-os”.", "#ffb84a")
+
+    def _add_row(self, addr, name):
+        w = QWidget(); w.setAttribute(Qt.WA_TranslucentBackground, True)
+        h = QHBoxLayout(w); h.setContentsMargins(12, 9, 12, 9); h.setSpacing(12)
+        ico = QLabel(_dev_glyph(name))
+        ico.setFont(QFont("Segoe UI Emoji", 14))
+        ico.setStyleSheet("background:transparent;")
+        h.addWidget(ico)
+        col = QVBoxLayout(); col.setSpacing(1); col.setContentsMargins(0, 0, 0, 0)
+        nm = QLabel(name)
+        nm.setFont(QFont("Segoe UI", 10, QFont.DemiBold))
+        nm.setStyleSheet("color:#ffffff; background:transparent;")
+        col.addWidget(nm)
+        sub = QLabel(addr)
+        sub.setFont(QFont("Segoe UI", 8))
+        sub.setStyleSheet("color: rgba(255,255,255,140); background:transparent;")
+        col.addWidget(sub)
+        h.addLayout(col, 1)
+        it = QListWidgetItem(self._list)
+        it.setSizeHint(w.sizeHint())
+        it.setData(Qt.UserRole, (addr, name))
+        self._list.addItem(it)
+        self._list.setItemWidget(it, w)
+
+    def _on_pick(self, item):
+        addr, name = item.data(Qt.UserRole)
+        self._info.setText(f"Connecting to {name}…")
+        self._set_status(f"Connecting to {name}…", "#9fc2ff")
+        def work():
+            ok, msg = _connect(self._node, addr, name)
+            self._status.emit(msg, "#7af0a0" if ok else "#ff7766")
+        threading.Thread(target=work, daemon=True).start()
+
+
+# ── entry point ─────────────────────────────────────────────────────────────
+def main(desktop=None):
+    panel = BluetoothPanel(desktop)
+    panel.show(); panel.raise_(); panel.activateWindow()
+    if desktop is not None:
+        try:
+            if not hasattr(desktop, "_vx_qt_panels"):
+                desktop._vx_qt_panels = {}
+            desktop._vx_qt_panels.setdefault(__file__, []).append(panel)
+            if not hasattr(desktop, "_panels"): desktop._panels = []
+            desktop._panels.append(panel)
+        except Exception:
+            pass
+    return panel
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    p = main(None)
+    sys.exit(app.exec_())

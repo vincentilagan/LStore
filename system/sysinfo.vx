@@ -1,0 +1,351 @@
+# VX:name=System Information
+# VX:icon=🖥
+# VX:version=1.0
+# VX:author=Vincent Ilagan
+# VX:net=none
+# VX:sig=bv1KKEcGsXPkU42wRklSyKOD1ztI21RHcDbe4OjzpFuYdp9lkIdzPWaIHSBjsrZtCPbvAzTTZoCtbhqPwGx+Dg==
+"""System Information — Luci OS's "dxdiag".
+
+A clean, glassy report of the machine: OS, CPU, memory, GPU, display,
+storage, network, audio and battery — gathered live from FreeBSD.
+Open it from Settings, from the dock, or by typing `sysinfo` in the
+terminal. "Copy report" puts the whole thing on the clipboard so you
+can paste it into a bug report or share it with a developer.
+"""
+
+import os, sys, subprocess, threading, platform, time, traceback
+from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui  import QFont, QPainter, QColor, QPen, QPainterPath, QLinearGradient
+from PyQt5.QtWidgets import (QWidget, QFrame, QLabel, QPushButton,
+                             QVBoxLayout, QHBoxLayout, QGridLayout,
+                             QScrollArea, QSizePolicy, QApplication)
+
+from luci import _QtLucyWindow, _UI_FAM
+
+ACC   = QColor(91, 159, 255)
+GOLD  = QColor(255, 200, 80)
+TEXT  = QColor(220, 232, 248)
+DIM   = QColor(140, 162, 200)
+GRN   = QColor(110, 220, 130)
+BORDER = QColor(70, 110, 170, 90)
+
+
+def _run(cmd, timeout=5):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout)
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _sysctl(name):
+    return _run(["sysctl", "-n", name], timeout=3)
+
+
+def _fmt_bytes(n):
+    try:
+        n = float(n)
+    except Exception:
+        return "—"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def gather():
+    """Return an ordered list of (section, [(key, value), ...])."""
+    out = []
+
+    # ── System ──────────────────────────────────────────────────────
+    osver = _run(["freebsd-version"]) or platform.platform()
+    kern  = _run(["uname", "-sr"])
+    host  = _run(["hostname"])
+    up    = _run(["uptime"])
+    up    = up.split("up ", 1)[1].split(",")[0].strip() if "up " in up else up
+    luci_ver = "Luci OS 3.x (developer preview)"
+    out.append(("System", [
+        ("Operating system", f"FreeBSD {osver}"),
+        ("Kernel",           kern or "—"),
+        ("Distribution",     luci_ver),
+        ("Hostname",         host or "—"),
+        ("Uptime",           up or "—"),
+        ("Architecture",     platform.machine()),
+    ]))
+
+    # ── Processor ───────────────────────────────────────────────────
+    model = _sysctl("hw.model")
+    ncpu  = _sysctl("hw.ncpu")
+    load  = _run(["uptime"])
+    load  = ("load" + load.split("load", 1)[1]) if "load" in load else "—"
+    out.append(("Processor", [
+        ("Model",  model or "—"),
+        ("Cores / threads", ncpu or "—"),
+        ("Current load",    load),
+    ]))
+
+    # ── Memory ──────────────────────────────────────────────────────
+    phys = _sysctl("hw.physmem")
+    free_pg  = _sysctl("vm.stats.vm.v_free_count")
+    pagesz   = _sysctl("hw.pagesize") or "4096"
+    try:
+        free_b = int(free_pg) * int(pagesz)
+    except Exception:
+        free_b = 0
+    swap = _run(["swapinfo", "-h"]).splitlines()
+    swap_line = swap[-1] if len(swap) > 1 else ""
+    out.append(("Memory", [
+        ("Total RAM",  _fmt_bytes(phys)),
+        ("Free RAM",   _fmt_bytes(free_b)),
+        ("Swap",       swap_line.replace("Total", "").strip() or "—"),
+    ]))
+
+    # ── Graphics ────────────────────────────────────────────────────
+    gpus = []
+    pci = _run(["pciconf", "-lv"], timeout=6)
+    blocks = pci.split("\n")
+    cur_vendor = cur_device = None
+    is_display = False
+    for ln in blocks:
+        s = ln.strip()
+        if not ln.startswith((" ", "\t")) and "@pci" in ln:
+            if is_display and (cur_vendor or cur_device):
+                gpus.append(f"{cur_vendor or ''} {cur_device or ''}".strip())
+            cur_vendor = cur_device = None
+            is_display = "class=0x030000" in ln
+        elif "vendor" in s and "=" in s:
+            cur_vendor = s.split("'")[1] if "'" in s else None
+        elif "device" in s and "=" in s and "'" in s:
+            cur_device = s.split("'")[1]
+    if is_display and (cur_vendor or cur_device):
+        gpus.append(f"{cur_vendor or ''} {cur_device or ''}".strip())
+    kld = _run(["kldstat"])
+    drivers = [d for d in ("nvidia", "i915", "amdgpu", "radeonkms")
+               if d in kld]
+    grows = [("GPU " + str(i + 1), g) for i, g in enumerate(gpus)] or \
+            [("GPU", "—")]
+    grows.append(("Loaded drivers", ", ".join(drivers) or "none"))
+    # Vulkan?
+    vk = _run(["sh", "-c",
+               "ls /usr/local/share/vulkan/icd.d/ 2>/dev/null"], timeout=3)
+    grows.append(("Vulkan ICDs", vk.replace("\n", ", ") or "—"))
+    out.append(("Graphics", grows))
+
+    # ── Display ─────────────────────────────────────────────────────
+    xr = _run(["sh", "-c",
+               "env DISPLAY=:0 xrandr 2>/dev/null | grep '\\*'"],
+              timeout=4)
+    res = xr.strip().split()[0] if xr.strip() else "—"
+    out.append(("Display", [
+        ("Resolution", res),
+        ("Compositor", "picom (xrender)" if _run(["pgrep", "picom"]) else "none"),
+    ]))
+
+    # ── Storage ─────────────────────────────────────────────────────
+    df = _run(["df", "-h"]).splitlines()
+    srows = []
+    for ln in df[1:]:
+        parts = ln.split()
+        if len(parts) >= 6 and parts[0].startswith("/dev/"):
+            srows.append((parts[5], f"{parts[2]} used / {parts[1]} "
+                                    f"({parts[4]})"))
+    out.append(("Storage", srows or [("Disk", "—")]))
+
+    # ── Network ─────────────────────────────────────────────────────
+    nrows = []
+    for iface in ("wlan0", "re0", "em0", "igb0"):
+        info = _run(["ifconfig", iface], timeout=3)
+        if not info:
+            continue
+        ip = ""
+        ssid = ""
+        for ln in info.splitlines():
+            ln = ln.strip()
+            if ln.startswith("inet "):
+                ip = ln.split()[1]
+            if "ssid" in ln:
+                try: ssid = ln.split('ssid ', 1)[1].split('"')[1]
+                except Exception: pass
+        status = "connected" if ip else (
+            "up (no IP)" if "RUNNING" in info else "down")
+        label = iface + (f" · {ssid}" if ssid else "")
+        nrows.append((label, f"{ip or '—'}  ({status})"))
+    out.append(("Network", nrows or [("Network", "—")]))
+
+    # ── Audio ───────────────────────────────────────────────────────
+    snd = _run(["cat", "/dev/sndstat"])
+    dev = "—"
+    for ln in snd.splitlines():
+        if "default" in ln and "<" in ln:
+            dev = ln.split("<", 1)[1].split(">", 1)[0]
+            break
+    vol = _run(["sh", "-c", "mixer vol 2>/dev/null | head -1"])
+    out.append(("Audio", [
+        ("Device",       dev),
+        ("Master volume", vol.split("=")[-1].strip() if "=" in vol else vol or "—"),
+    ]))
+
+    # ── Battery ─────────────────────────────────────────────────────
+    bat = _run(["acpiconf", "-i", "0"], timeout=3)
+    state = remain = life = ""
+    for ln in bat.splitlines():
+        if "State:" in ln:           state  = ln.split(":", 1)[1].strip()
+        if "Remaining capacity" in ln: life = ln.split(":", 1)[1].strip()
+        if "Remaining time" in ln:   remain = ln.split(":", 1)[1].strip()
+    if state or life:
+        out.append(("Battery", [
+            ("State",      state or "—"),
+            ("Charge",     life or "—"),
+            ("Time left",  remain or "—"),
+        ]))
+
+    # ── Software ────────────────────────────────────────────────────
+    pyv = sys.version.split()[0]
+    model_f = "/usr/local/luci/Vinx-AI/memory/models/vinX.gguf"
+    msz = _fmt_bytes(os.path.getsize(model_f)) if os.path.isfile(model_f) else "—"
+    comp = _run(["cat", "/usr/local/luci/Vinx-AI/memory/compute.json"])
+    out.append(("AI / Software", [
+        ("Python",        pyv),
+        ("VinX model",    msz),
+        ("Compute mode",  comp.replace('{', '').replace('}', '')
+                              .replace('"mode":', '').replace('"', '').strip()
+                          or "auto"),
+    ]))
+    return out
+
+
+# ── UI pieces ───────────────────────────────────────────────────────
+class Card(QFrame):
+    def __init__(self, title, rows, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self._title = title
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 14, 18, 14); lay.setSpacing(8)
+        t = QLabel(title.upper())
+        t.setFont(QFont(_UI_FAM, 9, QFont.DemiBold))
+        t.setStyleSheet("color:#5b9fff;letter-spacing:2px;"
+                        "background:transparent;")
+        lay.addWidget(t)
+        grid = QGridLayout(); grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(6)
+        for i, (k, v) in enumerate(rows):
+            kl = QLabel(str(k)); kl.setFont(QFont(_UI_FAM, 9))
+            kl.setStyleSheet("color:#8ca2c8;background:transparent;")
+            kl.setMinimumWidth(150)
+            vl = QLabel(str(v)); vl.setFont(QFont(_UI_FAM, 9, QFont.DemiBold))
+            vl.setStyleSheet("color:#dce8f8;background:transparent;")
+            vl.setWordWrap(True)
+            vl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            grid.addWidget(kl, i, 0, Qt.AlignTop)
+            grid.addWidget(vl, i, 1)
+        grid.setColumnStretch(1, 1)
+        lay.addLayout(grid)
+
+    def paintEvent(self, _e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect().adjusted(0, 0, -1, -1)
+        path = QPainterPath(); path.addRoundedRect(float(r.x()), float(r.y()),
+                                                   float(r.width()),
+                                                   float(r.height()), 12, 12)
+        g = QLinearGradient(0, 0, 0, self.height())
+        g.setColorAt(0, QColor(28, 40, 64, 210))
+        g.setColorAt(1, QColor(14, 22, 40, 220))
+        p.fillPath(path, g)
+        p.setPen(QPen(BORDER, 1.0)); p.drawPath(path)
+
+
+class SysInfo(_QtLucyWindow):
+    ready = pyqtSignal(object)
+
+    def __init__(self, desktop):
+        super().__init__(desktop, "System Information", 720, 760, "🖥")
+        self._desktop = desktop
+        self.ready.connect(self._populate)
+        self._build()
+        self._refresh()
+
+    def _build(self):
+        root = QVBoxLayout(self.content)
+        root.setContentsMargins(12, 10, 12, 12); root.setSpacing(10)
+        # header
+        top = QHBoxLayout()
+        h = QLabel("🖥  System Information")
+        h.setFont(QFont(_UI_FAM, 14, QFont.Bold))
+        h.setStyleSheet("color:#dce8f8;background:transparent;")
+        top.addWidget(h); top.addStretch(1)
+        self._b_copy = QPushButton("📋  Copy report")
+        self._b_ref  = QPushButton("↻  Refresh")
+        for b in (self._b_ref, self._b_copy):
+            b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(
+                "QPushButton{background:rgba(48,70,110,120);color:#dce8f8;"
+                "border:1px solid rgba(120,160,220,90);border-radius:9px;"
+                "padding:7px 16px;font-weight:600;}"
+                "QPushButton:hover{background:rgba(70,100,150,150);}")
+            top.addWidget(b)
+        self._b_ref.clicked.connect(self._refresh)
+        self._b_copy.clicked.connect(self._copy)
+        root.addLayout(top)
+        # scroll area for cards
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setStyleSheet(
+            "QScrollArea{background:transparent;}"
+            "QScrollBar:vertical{background:transparent;width:8px;}"
+            "QScrollBar::handle:vertical{background:rgba(120,160,220,90);"
+            "border-radius:4px;min-height:24px;}"
+            "QScrollBar::add-line,QScrollBar::sub-line{height:0;}")
+        self._inner = QWidget()
+        self._inner.setStyleSheet("background:transparent;")
+        self._vlay = QVBoxLayout(self._inner)
+        self._vlay.setContentsMargins(2, 2, 8, 2); self._vlay.setSpacing(10)
+        self._vlay.addStretch(1)
+        self._scroll.setWidget(self._inner)
+        root.addWidget(self._scroll, 1)
+        self._status = QLabel("gathering…")
+        self._status.setFont(QFont(_UI_FAM, 8))
+        self._status.setStyleSheet("color:#8ca2c8;background:transparent;")
+        root.addWidget(self._status)
+        self._data = []
+
+    def _refresh(self):
+        self._status.setText("gathering…")
+        def work():
+            try:
+                data = gather()
+            except Exception:
+                traceback.print_exc()
+                data = [("Error", [("gather failed", "see log")])]
+            self.ready.emit(data)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _populate(self, data):
+        self._data = data
+        # clear old cards
+        while self._vlay.count() > 1:
+            it = self._vlay.takeAt(0)
+            w = it.widget()
+            if w: w.deleteLater()
+        for title, rows in data:
+            self._vlay.insertWidget(self._vlay.count() - 1, Card(title, rows))
+        self._status.setText("updated " + time.strftime("%H:%M:%S"))
+
+    def _copy(self):
+        lines = ["===== Luci OS — System Information ====="]
+        for title, rows in self._data:
+            lines.append(f"\n[{title}]")
+            for k, v in rows:
+                lines.append(f"  {k:<18} {v}")
+        try:
+            QApplication.clipboard().setText("\n".join(lines))
+            self._status.setText("report copied to clipboard")
+        except Exception:
+            self._status.setText("copy failed")
+
+
+def main(desktop):
+    SysInfo(desktop)

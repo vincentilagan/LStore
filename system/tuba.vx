@@ -1,0 +1,487 @@
+# VX:name=Tuba
+# VX:icon=🎺
+# VX:version=0.2
+# VX:author=Vincent Ilagan
+# VX:net=local
+# VX:sig=3vZJWDwwubDPwvcYP89bHoI8d9HY4wOR6sG8f3mX7oIEf5BNc7CN+F8oPCkUCYv5tcX5OmZsmGchH5fQIkJ+Cw==
+# ──────────────────────────────────────────────────────────────────────
+#  Tuba — Luci's SILENT Apple disk-image handler.
+#
+#  No window. Double-click a .dmg in Files and Tuba quietly opens the
+#  image, finds the Apple app inside, and installs it into
+#  ~/Applications — just a toast tells you it's done.
+#
+#  LEGAL — read before editing.
+#  Tuba reads/extracts open disk-image formats (.dmg/.iso/.img) using
+#  only OPEN-SOURCE tools (p7zip — LGPL). It bundles NO Apple code,
+#  frameworks or trademarks. "Install" = extract the .app bundle's files
+#  into a Luci folder; it does NOT execute Apple binaries. Actually
+#  RUNNING an Apple app needs a separate clean-room runtime (Mach-O
+#  loader + Objective-C runtime + a Cocoa reimplementation); that is a
+#  future stage and Tuba is honest about it. All original Luci code.
+# ──────────────────────────────────────────────────────────────────────
+"""Tuba — silent .dmg handler. Wired into Files: double-clicking a .dmg
+calls install_dmg(), which extracts the Apple app inside into
+~/Applications in the background. Opens no window."""
+
+import os, re, json, struct, shutil, subprocess, threading
+from PyQt5.QtCore import QObject, pyqtSignal
+
+HOME = os.path.expanduser("~")
+APPS_DIR = os.path.join(HOME, "Applications")
+ICONS_DIR = os.path.join(APPS_DIR, ".icons")     # extracted PNG app icons
+META_DIR  = os.path.join(APPS_DIR, ".meta")       # per-app runtime analysis
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  TUBA RUNTIME — Stage 1: Mach-O loader / analyser.
+#
+#  100% ORIGINAL Luci code. It only READS the (publicly documented)
+#  Mach-O binary format — like a hex editor — to understand an Apple
+#  executable: its CPU slices, the frameworks it links, and its entry
+#  point. No Apple code, headers or frameworks are used or shipped.
+#  This is the foundation a future Stage 2 (our own dyld + libSystem
+#  shims + syscall translation) would build on to actually execute.
+# ══════════════════════════════════════════════════════════════════════
+_CPU = {0x01000007: "x86_64", 0x0100000c: "arm64",
+        0x00000007: "i386",   0x0000000c: "arm"}
+# GUI toolkits — if the binary links these it needs a Cocoa-class
+# reimplementation to run (Stage 2+); otherwise it may be a plain CLI.
+_GUI_FW = {"AppKit", "Cocoa", "UIKit", "Metal", "QuartzCore",
+           "SwiftUI", "Carbon"}
+# Load-command ids that name a linked dylib (low 31 bits).
+_DYLIB_CMDS = {0x0c, 0x18, 0x1f, 0x23}   # LOAD / WEAK / REEXPORT / UPWARD
+_LC_MAIN       = 0x80000028
+_LC_SEGMENT_64 = 0x19
+_LC_SYMTAB     = 0x02
+
+
+def _parse_slice(f, soff):
+    """Parse ONE Mach-O image at file offset `soff`. Returns a dict with
+    its arch, linked dylibs and entry offset (or None if not Mach-O)."""
+    try:
+        f.seek(soff)
+        magic = struct.unpack("<I", f.read(4))[0]
+    except Exception:
+        return None
+    if magic in (0xfeedfacf, 0xfeedface):
+        en = "<"
+    elif magic in (0xcffaedfe, 0xcefaedfe):
+        en = ">"
+    else:
+        return None
+    is64 = magic in (0xfeedfacf, 0xcffaedfe)
+    try:
+        cputype = struct.unpack(en + "I", f.read(4))[0]
+        f.read(8)                                   # cpusubtype + filetype
+        ncmds = struct.unpack(en + "I", f.read(4))[0]
+        sizeofcmds = struct.unpack(en + "I", f.read(4))[0]
+        f.read(4)                                   # flags
+        if is64:
+            f.read(4)                               # reserved
+        cmds = f.read(sizeofcmds)
+    except Exception:
+        return None
+    dylibs, entry, p = [], None, 0
+    segments, symtab = [], None
+    for _ in range(ncmds):
+        if p + 8 > len(cmds):
+            break
+        cmd, cmdsize = struct.unpack_from(en + "II", cmds, p)
+        if cmdsize == 0:
+            break
+        if (cmd & 0x7fffffff) in _DYLIB_CMDS:
+            try:
+                nameoff = struct.unpack_from(en + "I", cmds, p + 8)[0]
+                s = cmds[p + nameoff:p + cmdsize].split(b"\x00", 1)[0]
+                dylibs.append(s.decode("utf-8", "replace"))
+            except Exception:
+                pass
+        elif cmd == _LC_MAIN:
+            try:
+                entry = struct.unpack_from(en + "Q", cmds, p + 8)[0]
+            except Exception:
+                pass
+        elif cmd == _LC_SEGMENT_64 and is64:
+            try:
+                segname = cmds[p + 8:p + 24].split(b"\x00", 1)[0].decode(
+                    "ascii", "replace")
+                vmaddr, vmsize, fileoff, filesize = struct.unpack_from(
+                    en + "QQQQ", cmds, p + 24)
+                maxprot, initprot = struct.unpack_from(en + "ii", cmds, p + 56)
+                segments.append({"name": segname, "vmaddr": vmaddr,
+                                 "vmsize": vmsize, "fileoff": fileoff,
+                                 "filesize": filesize, "prot": initprot})
+            except Exception:
+                pass
+        elif cmd == _LC_SYMTAB:
+            try:
+                symtab = struct.unpack_from(en + "IIII", cmds, p + 8)
+            except Exception:
+                pass
+        p += cmdsize
+
+    # Stage-2 dyld precursor: which external symbols must the runtime
+    # supply? Undefined (N_UNDF, non-stab) entries in the symbol table.
+    imports = []
+    if symtab and is64:
+        symoff, nsyms, stroff, strsize = symtab
+        try:
+            f.seek(soff + symoff); raw = f.read(min(nsyms, 200000) * 16)
+            f.seek(soff + stroff); strtab = f.read(min(strsize, 4 << 20))
+            for i in range(len(raw) // 16):
+                n_strx, n_type, _sect, _desc, n_val = struct.unpack_from(
+                    en + "IBBHQ", raw, i * 16)
+                if (n_type & 0xe0) == 0 and (n_type & 0x0e) == 0:   # undefined
+                    e = strtab.find(b"\x00", n_strx)
+                    nm = strtab[n_strx:e].decode("utf-8", "replace")
+                    if nm:
+                        imports.append(nm)
+        except Exception:
+            pass
+    return {"arch": _CPU.get(cputype, hex(cputype)), "dylibs": dylibs,
+            "entry": entry, "segments": segments, "imports": imports}
+
+
+def analyze_macho(path):
+    """Analyse a Mach-O (thin or fat/universal) executable. Returns
+    {archs, dylibs, frameworks, gui, cli, entry} — our own reading of
+    the binary, no external tools, no Apple code."""
+    out = {"archs": [], "dylibs": [], "frameworks": [], "segments": [],
+           "imports": [], "n_imports": 0, "gui": False, "cli": False,
+           "entry": None}
+    try:
+        f = open(path, "rb")
+    except Exception:
+        return out
+    with f:
+        try:
+            head = f.read(8)
+            magic = struct.unpack(">I", head[:4])[0]
+        except Exception:
+            return out
+        slices = []
+        if magic in (0xcafebabe, 0xbebafeca):        # FAT / universal
+            en = ">" if magic == 0xcafebabe else "<"
+            try:
+                nfat = struct.unpack(en + "I", head[4:8])[0]
+                for _ in range(min(nfat, 16)):
+                    rec = f.read(20)
+                    _ct, _cs, off, _sz, _al = struct.unpack(en + "IIIII", rec)
+                    slices.append(off)
+            except Exception:
+                slices = []
+        else:
+            slices = [0]
+        seen = set()
+        for soff in slices:
+            info = _parse_slice(f, soff)
+            if not info:
+                continue
+            out["archs"].append(info["arch"])
+            for d in info["dylibs"]:
+                if d not in seen:
+                    seen.add(d); out["dylibs"].append(d)
+            if info["entry"] is not None:
+                out["entry"] = info["entry"]
+            # Segments + imports: keep the richest slice (first non-empty).
+            if info.get("segments") and not out["segments"]:
+                out["segments"] = info["segments"]
+            if info.get("imports") and not out["imports"]:
+                imps = sorted(set(info["imports"]))
+                out["imports"] = imps[:60]        # sample for the plan
+                out["n_imports"] = len(imps)
+    fw = []
+    for d in out["dylibs"]:
+        if "/Frameworks/" in d:
+            fw.append(d.split("/Frameworks/", 1)[1].split(".framework", 1)[0])
+    out["frameworks"] = sorted(set(fw))
+    out["gui"] = any(x in _GUI_FW for x in out["frameworks"])
+    out["cli"] = not out["gui"]
+    return out
+
+
+def _bundle_exe(app_dir):
+    """CFBundleExecutable from Info.plist (XML form). Falls back to None
+    so callers pick the first MacOS/ binary."""
+    plist = os.path.join(app_dir, "Contents", "Info.plist")
+    try:
+        txt = open(plist, "r", encoding="utf-8", errors="replace").read()
+        m = re.search(r"<key>CFBundleExecutable</key>\s*<string>([^<]+)</string>",
+                      txt)
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
+def analyze_app(app_dir):
+    """Find an app bundle's main Mach-O and analyse it. Returns the
+    analyze_macho() dict plus the binary path, or None."""
+    macos = os.path.join(app_dir, "Contents", "MacOS")
+    if not os.path.isdir(macos):
+        return None
+    exe = _bundle_exe(app_dir)
+    cand = os.path.join(macos, exe) if exe else None
+    if not (cand and os.path.isfile(cand)):
+        cand = None
+        for b in sorted(os.listdir(macos)):
+            bp = os.path.join(macos, b)
+            if os.path.isfile(bp) and not b.startswith("."):
+                cand = bp; break
+    if not cand:
+        return None
+    info = analyze_macho(cand)
+    info["binary"] = cand
+    return info
+
+
+def runtime_verdict(info):
+    """Plain-English status of whether the Tuba runtime can run this.
+    Honest: our binder (tuba_exec.load_and_bind) runs command-line Mach-O
+    by resolving libc/libc++ imports to the host FreeBSD libraries. GUI
+    apps link Apple frameworks (Cocoa/AppKit/Foundation) that do not exist
+    on FreeBSD and would need a Darling-scale reimplementation — Tuba does
+    NOT run those, and we will not clone Apple code to make it."""
+    if not info or not info.get("archs"):
+        return "not a recognisable Apple binary"
+    archs = "+".join(info["archs"])
+    if info.get("gui"):
+        fws = ", ".join(info["frameworks"][:4]) or "Cocoa"
+        return (f"{archs} · GUI app — NOT runnable on Luci. Links Apple "
+                f"frameworks ({fws}) with no FreeBSD equivalent.")
+    return (f"{archs} · command-line binary — runnable via Tuba binder "
+            "(imports resolve to host libc/libc++).")
+
+
+def load_plan(info):
+    """Stage-2 'load plan': the memory segments to map and the external
+    symbols the runtime must supply. This is the concrete spec a future
+    executor (our own dyld) works from — real output, no Apple code."""
+    if not info or not info.get("archs"):
+        return "not a recognisable Apple binary"
+    lines = [f"arch: {'+'.join(info['archs'])}   entry: "
+             f"{hex(info['entry']) if info.get('entry') is not None else '—'}"]
+    lines.append("segments to map:")
+    for s in info.get("segments", [])[:8]:
+        prot = "".join(c for c, b in zip("rwx", (4, 2, 1)) if s["prot"] & b)
+        lines.append(f"  {s['name']:12} vm={hex(s['vmaddr'])} "
+                     f"size={s['vmsize']:>10} prot={prot or '---'}")
+    n = info.get("n_imports", 0)
+    sample = ", ".join(info.get("imports", [])[:6])
+    lines.append(f"external symbols to provide: {n}"
+                 + (f"  (e.g. {sample})" if sample else ""))
+    fw = info.get("frameworks", [])
+    if fw:
+        lines.append("frameworks to reimplement: " + ", ".join(fw))
+    return "\n".join(lines)
+
+
+def _which(*names):
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
+
+
+def _run(cmd, timeout=600):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as ex:
+        class _R:
+            returncode = 1; stdout = ""; stderr = str(ex)
+        return _R()
+
+
+def _list_image(sevenzip, image):
+    r = _run([sevenzip, "l", "-ba", "-slt", image], timeout=60)
+    out, cur = [], {}
+    for line in (r.stdout or "").splitlines():
+        line = line.rstrip()
+        if line.startswith("Path = "):
+            cur["path"] = line[7:]
+        elif line.startswith("Attributes = "):
+            cur["attr"] = line[13:]
+        elif line == "" and cur:
+            if cur.get("path"):
+                out.append(cur["path"])
+            cur = {}
+    if cur.get("path"):
+        out.append(cur["path"])
+    return out
+
+
+def _find_apps(paths):
+    apps = set()
+    for p in paths:
+        for part in p.replace("\\", "/").split("/"):
+            if part.endswith(".app"):
+                apps.add(part); break
+    return sorted(apps)
+
+
+def _extract_app(sevenzip, image, app_name, dest_dir):
+    os.makedirs(dest_dir, exist_ok=True)
+    r = _run([sevenzip, "x", image, f"-o{dest_dir}", f"*{app_name}*", "-y"],
+             timeout=900)
+    return r.returncode == 0
+
+
+def _extract_icon(app_dir, out_png):
+    """Pull the app's real icon out of its .icns into a PNG, so it shows
+    up in the Launchpad / dock / desktop. Apple .icns files embed PNGs
+    for the larger sizes; we just grab the biggest embedded PNG — pure
+    Python, no external converter needed. Returns True on success."""
+    res = os.path.join(app_dir, "Contents", "Resources")
+    if not os.path.isdir(res):
+        return False
+    icns = [os.path.join(res, f) for f in os.listdir(res)
+            if f.lower().endswith(".icns")]
+    if not icns:
+        return False
+    # Largest .icns is almost always the app icon (vs document icons).
+    icns.sort(key=lambda p: os.path.getsize(p), reverse=True)
+    try:
+        data = open(icns[0], "rb").read()
+    except Exception:
+        return False
+    sig = b"\x89PNG\r\n\x1a\n"
+    best, best_len, i = None, 0, data.find(sig)
+    while i != -1:
+        end = data.find(b"IEND", i)
+        if end != -1:
+            png = data[i:end + 8]          # IEND + 4-byte CRC
+            if len(png) > best_len:
+                best, best_len = png, len(png)
+        i = data.find(sig, i + 1)
+    if not best:
+        return False
+    try:
+        os.makedirs(os.path.dirname(out_png), exist_ok=True)
+        with open(out_png, "wb") as f:
+            f.write(best)
+        return True
+    except Exception:
+        return False
+
+
+# Cross-thread toast: a worker thread emits, the GUI thread shows it.
+class _TubaBridge(QObject):
+    toast = pyqtSignal(str)
+
+
+def install_dmg(desktop, dmg_path):
+    """SILENT entry point — called by Files on .dmg double-click. Opens
+    no window; extracts the Apple app(s) into ~/Applications and toasts
+    the result. All heavy work runs off the GUI thread."""
+    def _show(msg):
+        try: desktop._toast(msg)
+        except Exception: pass
+
+    # Bridge created on the GUI thread; kept on `desktop` so it survives.
+    bridge = _TubaBridge()
+    bridge.toast.connect(_show)
+    desktop._tuba_bridge = bridge
+
+    sevenzip = _which("7z", "7zz", "7za")
+    if not sevenzip:
+        _show("🎺 Tuba: p7zip not installed — can't open .dmg yet.")
+        return
+    name = os.path.basename(dmg_path)
+    _show(f"🎺 Tuba: opening {name}…")
+
+    def work():
+        try:
+            paths = _list_image(sevenzip, dmg_path)
+            apps = _find_apps(paths)
+            if not apps:
+                bridge.toast.emit(f"🎺 Tuba: no Apple app found in {name}.")
+                return
+            done, verdicts = [], []
+            for app in apps:
+                if _extract_app(sevenzip, dmg_path, app, APPS_DIR):
+                    base = app[:-4] if app.endswith(".app") else app
+                    app_dir = os.path.join(APPS_DIR, app)
+                    # Pull out the real icon so it shows in the Launchpad.
+                    try:
+                        _extract_icon(app_dir,
+                                      os.path.join(ICONS_DIR, base + ".png"))
+                    except Exception:
+                        pass
+                    # Stage-1 runtime: analyse the Mach-O binary + store it.
+                    try:
+                        info = analyze_app(app_dir)
+                        if info:
+                            os.makedirs(META_DIR, exist_ok=True)
+                            with open(os.path.join(META_DIR, base + ".json"),
+                                      "w", encoding="utf-8") as mf:
+                                json.dump(info, mf, indent=2)
+                            verdicts.append(runtime_verdict(info))
+                    except Exception:
+                        pass
+                    done.append(base)
+            if done:
+                msg = "🎺 Tuba installed: " + ", ".join(done) + "  →  Applications"
+                if verdicts:
+                    msg += "\n   " + verdicts[0]
+                bridge.toast.emit(msg)
+            else:
+                bridge.toast.emit(f"🎺 Tuba: couldn't extract the app from {name}.")
+        except Exception as ex:
+            bridge.toast.emit(f"🎺 Tuba error: {ex}")
+    threading.Thread(target=work, daemon=True).start()
+
+
+def run_macho(desktop, path):
+    """Run a Mach-O the HONEST way. Command-line binaries execute through
+    our own binder (tuba_exec.py --bind-run), which resolves their libc /
+    libc++ imports to the host FreeBSD libraries. GUI (Cocoa) apps link
+    Apple frameworks with no FreeBSD equivalent, so we say so plainly
+    instead of pretending — and never clone Apple code to fake it."""
+    def _show(msg):
+        try: desktop._toast(msg)
+        except Exception: pass
+    try:
+        info = analyze_macho(path)
+    except Exception:
+        info = None
+    if not info or not info.get("archs"):
+        _show("🎺 Tuba: not a recognisable Apple binary."); return
+    base = os.path.basename(path)
+    if info.get("gui"):
+        fws = ", ".join(info.get("frameworks", [])[:3]) or "Cocoa"
+        _show(f"🎺 {base} is a macOS GUI app (needs {fws}) — it can't run "
+              "on Luci. Tuba runs command-line Mach-O only.")
+        return
+    # Command-line binary → run it through our binder off the GUI thread.
+    bridge = _TubaBridge()
+    bridge.toast.connect(_show)
+    desktop._tuba_run_bridge = bridge
+    _show(f"🎺 Tuba: running {base}…")
+    exe = os.path.join(os.path.dirname(__file__), "tuba_exec.py")
+
+    def work():
+        try:
+            r = subprocess.run(["python3", exe, "--bind-run", path],
+                               capture_output=True, text=True, timeout=30)
+            out = (r.stdout or "").strip() or (r.stderr or "").strip() \
+                or "(ran, no output)"
+        except Exception as ex:
+            out = "error: " + str(ex)
+        bridge.toast.emit(f"🎺 {base}:\n{out[:400]}")
+    threading.Thread(target=work, daemon=True).start()
+
+
+def main(desktop):
+    """Launched directly (e.g. from the app list). Tuba has no window —
+    it's a silent background handler — so it just shows ONE brief,
+    auto-dismissing reminder. main() runs on the GUI thread, so the
+    toast's close-timer works normally (an earlier self-test toasted
+    from a worker thread, whose timer never fired → it stuck on screen)."""
+    try:
+        desktop._toast("🎺 Tuba is a background handler — double-click a "
+                       ".dmg in Files and it installs the app.")
+    except Exception:
+        pass

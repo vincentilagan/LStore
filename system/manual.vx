@@ -1,0 +1,209 @@
+﻿# VX:name=VX Manual
+# VX:icon=📖
+# VX:version=1.0
+# VX:author=VinX
+# VX:sig=258AsnFvTS8O2m0v1l/cy/xMM6k21QtVsw958QFhAF0jYzAnJHDoS44TSInm+FgbNbK3MF6W5JWXMLO1J0E8Bg==
+
+import tkinter as tk
+import os
+
+# Manual lives in programfiles/ — hidden, never auto-deleted
+MANUAL_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "vx_manual.txt"
+)
+
+SECTIONS = [
+    "WHAT IS THIS WHOLE THING?",
+    "WHAT OS IS LUCI?",
+    "ARCHITECTURE",
+    "NODEBASE: EDITOR vs PLAYER",
+    "WHAT IS A .VX FILE?",
+    "FILE STRUCTURE OF A .VX APP",
+    "THE desktop OBJECT",
+    "USING LucyWindow",
+    "COLORS & THEME",
+    "WHERE TO PLACE .VX FILES",
+    "GATE",
+    "CALLING VINX AI",
+    "THE OLD SOUL",
+    "THE FLOATING CORE",
+    "NODEBASE",
+    "WHY .vx AND .nbg",
+    "MINIMAL EXAMPLE",
+    "REAL EXAMPLE",
+    "HOW LUCI LOADS A .VX FILE",
+    "THE PORT SYSTEM",
+    "CONSTELLATION THEME",
+    "TIPS",
+    "FILE SYSTEM REFERENCE",
+    "BUILT-IN APPS",
+]
+
+C = {
+    "bg":      "#080e1a",
+    "panel":   "#0d1525",
+    "border":  "#1e3050",
+    "accent":  "#3a7bd5",
+    "accent2": "#5b9fff",
+    "text":    "#d0e8ff",
+    "dim":     "#567090",
+    "yellow":  "#ffcc44",
+    "green":   "#3ddc84",
+    "win_bg":  "#0a1220",
+    "bar":     "#0e1e38",
+    "red":     "#ff5555",
+}
+
+
+def main(desktop):
+    win = tk.Toplevel(desktop.root)
+    win.overrideredirect(True)
+    win.configure(bg=C["border"])
+
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    w, h = 820, 580
+    win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2-20}")
+
+    # ── Title bar ──────────────────────────────────────────────────────────────
+    # ── Title bar (global Luci chrome) ─────────────────────────────
+    if hasattr(desktop, "apply_chrome"):
+        desktop.apply_chrome(win, title="VX App Format — Developer Manual",
+                              icon="📖", include_body=False)
+    else:
+        bar = tk.Frame(win, bg=C["bar"], height=32)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        tk.Label(bar, text="  📖  VX App Format — Developer Manual",
+                 bg=C["bar"], fg=C["text"],
+                 font=("Segoe UI", 10, "bold")).pack(side="left", fill="y")
+        tk.Button(bar, text="✕", bg=C["bar"], fg=C["dim"],
+                  activebackground=C["red"], activeforeground="white",
+                  font=("Segoe UI", 10, "bold"), relief="flat", bd=0, padx=10,
+                  command=win.destroy).pack(side="right", fill="y")
+    
+        drag = [None]
+        def ds(e): drag[0] = (e.x_root - win.winfo_x(), e.y_root - win.winfo_y())
+        def dm(e):
+            if drag[0]: win.geometry(f"+{e.x_root-drag[0][0]}+{e.y_root-drag[0][1]}")
+        bar.bind("<ButtonPress-1>", ds)
+        bar.bind("<B1-Motion>", dm)
+
+    # ── Body ───────────────────────────────────────────────────────────────────
+    body = tk.Frame(win, bg=C["bg"])
+    body.pack(fill="both", expand=True)
+
+    # Left: section index
+    sidebar = tk.Frame(body, bg=C["panel"], width=200)
+    sidebar.pack(side="left", fill="y")
+    sidebar.pack_propagate(False)
+
+    tk.Label(sidebar, text="  Sections", bg=C["panel"], fg=C["dim"],
+             font=("Segoe UI", 8, "bold"), anchor="w",
+             pady=8).pack(fill="x")
+
+    tk.Frame(sidebar, bg=C["border"], height=1).pack(fill="x", padx=8)
+
+    # Right: content viewer
+    right = tk.Frame(body, bg=C["win_bg"])
+    right.pack(side="left", fill="both", expand=True)
+
+    sb = tk.Scrollbar(right, bg=C["border"], troughcolor=C["panel"])
+    sb.pack(side="right", fill="y")
+
+    txt = tk.Text(right, bg=C["win_bg"], fg=C["text"],
+                  font=("Consolas", 10), relief="flat", bd=12,
+                  wrap="word", state="disabled",
+                  yscrollcommand=sb.set,
+                  selectbackground=C["accent"],
+                  spacing1=2, spacing3=2)
+    txt.pack(fill="both", expand=True)
+    sb.config(command=txt.yview)
+
+    # Tags
+    txt.tag_config("header",  foreground=C["yellow"],  font=("Consolas", 10, "bold"))
+    txt.tag_config("box",     foreground=C["accent2"], font=("Consolas", 10, "bold"))
+    txt.tag_config("dim",     foreground=C["dim"])
+    txt.tag_config("green",   foreground=C["green"])
+    txt.tag_config("accent",  foreground=C["accent2"])
+    txt.tag_config("vxline",  foreground=C["yellow"])
+    txt.tag_config("kwline",  foreground="#5b9fff")
+    txt.tag_config("strline", foreground="#88ddaa")
+    txt.tag_config("cmtline", foreground="#3a6080")
+    txt.tag_config("code_bg", background="#020d18")
+
+    def _insert(text, tag=None):
+        txt.config(state="normal")
+        if tag:
+            txt.insert("end", text, tag)
+        else:
+            txt.insert("end", text)
+        txt.config(state="disabled")
+
+    def _load_manual():
+        txt.config(state="normal")
+        txt.delete("1.0", "end")
+        txt.config(state="disabled")
+        try:
+            content = open(MANUAL_PATH, encoding="utf-8").read()
+        except Exception as e:
+            _insert(f"Could not load manual:\n{e}\n\nExpected path:\n{MANUAL_PATH}", "dim")
+            return
+
+        for line in content.splitlines(keepends=True):
+            stripped = line.rstrip("\n")
+            if stripped.startswith("╔") or stripped.startswith("╚") or stripped.startswith("║"):
+                _insert(line, "box")
+            elif stripped.startswith("━"):
+                _insert(line, "dim")
+            elif stripped.strip().isupper() and len(stripped.strip()) > 4 and stripped.startswith("  "):
+                _insert(line, "header")
+            elif stripped.startswith("  # VX:"):
+                _insert(line, "vxline")
+            elif stripped.startswith("  #"):
+                _insert(line, "cmtline")
+            elif any(kw in stripped for kw in ("def main", "class ", "import ", "from lucy")):
+                _insert(line, "kwline")
+            elif "desktop.root" in stripped or "desktop.launch_vx" in stripped or "desktop._windows" in stripped:
+                _insert(line, "accent")
+            elif stripped.startswith("  C[") or stripped.startswith("  FONT"):
+                _insert(line, "strline")
+            elif stripped.startswith("VERSION") or stripped.startswith("UPDATED") or stripped.startswith("AUTHOR"):
+                _insert(line, "dim")
+            else:
+                _insert(line)
+
+    _load_manual()
+
+    # Section jump buttons
+    def _jump(section):
+        content = txt.get("1.0", "end")
+        idx = content.find(section)
+        if idx >= 0:
+            line = content[:idx].count("\n") + 1
+            txt.see(f"{line}.0")
+            txt.mark_set("insert", f"{line}.0")
+
+    for sec in SECTIONS:
+        label = sec.replace("THE ", "").replace("USING ", "").replace("CALLING ", "")
+        label = label[:28]
+        btn = tk.Button(sidebar, text=f"  {label}",
+                        bg=C["panel"], fg=C["dim"],
+                        font=("Segoe UI", 8), relief="flat", bd=0,
+                        anchor="w", pady=3,
+                        activebackground=C["border"],
+                        activeforeground=C["text"],
+                        command=lambda s=sec: _jump(s))
+        btn.pack(fill="x", padx=2)
+
+    # Bottom bar
+    bot = tk.Frame(win, bg=C["panel"], height=28)
+    bot.pack(fill="x")
+    bot.pack_propagate(False)
+    tk.Label(bot, text=f"  {MANUAL_PATH}",
+             bg=C["panel"], fg=C["dim"],
+             font=("Segoe UI", 8)).pack(side="left", fill="y")
+    tk.Label(bot, text="Gate: cat programfiles/vx_manual.txt  ",
+             bg=C["panel"], fg=C["dim"],
+             font=("Segoe UI", 8)).pack(side="right", fill="y")

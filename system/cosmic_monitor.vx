@@ -1,0 +1,135 @@
+# VX:name=Cosmic Monitor
+# VX:icon=🛰
+# VX:version=1.0
+# VX:author=VinX
+# VX:sig=vTc/TYFX0T416Qx05jERwe9B4gD2uyjQoIRnN2wLKsk6zXB5GP02Y2vocgdMAoxBqBqZixnifgheREA/Bhx7BA==
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Cosmic Monitor — a window into the Cosmic Core service layer.
+#  Shows Cosmic Core info + a LIVE feed of the Cosmic Bus event stream.
+#  This is how you SEE that Cosmic is alive and what is flowing through it.
+#
+#  Cosmic itself stays an invisible background layer — this is just a viewer.
+# ════════════════════════════════════════════════════════════════════════════
+
+import tkinter as tk
+import os, sys, time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from luci import C, FONT_BOLD, FONT_SM
+
+
+def main(desktop):
+    cosmic = getattr(desktop, "cosmic", None)
+
+    win = tk.Toplevel(desktop.root)
+    win.overrideredirect(True)
+    win.configure(bg="#0a0f1e")
+    w, h = 560, 420
+    sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
+    win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+    win.lift()
+
+    # ── Title bar (draggable) ────────────────────────────────────────────────
+    # ── Title bar (global Luci chrome) ─────────────────────────────
+    if hasattr(desktop, "apply_chrome"):
+        desktop.apply_chrome(win, title="Cosmic Monitor",
+                              icon="🛰", include_body=False)
+    else:
+        bar = tk.Frame(win, bg="#10204a", height=30)
+        bar.pack(fill="x"); bar.pack_propagate(False)
+        tk.Label(bar, text="  🛰  Cosmic Monitor", bg="#10204a",
+                 fg="#7fb0ff", font=FONT_BOLD).pack(side="left", fill="y")
+        tk.Button(bar, text="✕", bg="#10204a", fg=C["dim"],
+                  activebackground=C["red"], font=FONT_BOLD, relief="flat",
+                  bd=0, padx=10, command=win.destroy).pack(side="right", fill="y")
+        _drag = [None]
+        bar.bind("<ButtonPress-1>",
+                 lambda e: _drag.__setitem__(0, (e.x_root - win.winfo_x(),
+                                                 e.y_root - win.winfo_y())))
+        bar.bind("<B1-Motion>",
+             lambda e: win.geometry(f"+{e.x_root-_drag[0][0]}+{e.y_root-_drag[0][1]}")
+             if _drag[0] else None)
+
+    # ── Cosmic not running — graceful message ────────────────────────────────
+    if cosmic is None:
+        tk.Label(win, text="\n  ⬡  Cosmic Core is not running.\n\n"
+                 "  Luci booted without the Cosmic service layer\n"
+                 "  (programfiles/cosmic/cosmic_core.vx missing or failed).\n\n"
+                 "  Luci still works — Cosmic is optional.",
+                 bg="#0a0f1e", fg=C["dim"], font=FONT_SM,
+                 justify="left", anchor="w").pack(fill="both", expand=True,
+                                                  padx=14, pady=10)
+        return
+
+    # ── Info strip ───────────────────────────────────────────────────────────
+    info_lbl = tk.Label(win, text="  …", bg="#0c1530", fg="#9fc0ff",
+                        font=("Consolas", 8), anchor="w")
+    info_lbl.pack(fill="x")
+
+    root_lbl = tk.Label(win, text="", bg="#0c1530", fg=C["dim"],
+                        font=("Consolas", 8), anchor="w")
+    root_lbl.pack(fill="x")
+
+    # ── Live bus event log ───────────────────────────────────────────────────
+    wrap = tk.Frame(win, bg="#0a0f1e")
+    wrap.pack(fill="both", expand=True, padx=1, pady=(2, 1))
+    sb = tk.Scrollbar(wrap)
+    sb.pack(side="right", fill="y")
+    log = tk.Text(wrap, bg="#070b16", fg="#cfe0ff", font=("Consolas", 8),
+                  relief="flat", bd=6, wrap="none", state="disabled",
+                  yscrollcommand=sb.set)
+    log.pack(fill="both", expand=True)
+    sb.config(command=log.yview)
+    log.tag_config("ok",  foreground="#5fe39a")
+    log.tag_config("err", foreground="#ff6b6b")
+    log.tag_config("ev",  foreground="#7fb0ff")
+
+    _state = {"sig": None}
+
+    def _refresh():
+        if not win.winfo_exists():
+            return
+        try:
+            evs = cosmic.bus.history(limit=300)
+        except Exception:
+            evs = []
+        # Only redraw when the event stream actually changed (no idle flicker).
+        sig = (len(evs), evs[-1]["time"] if evs else 0.0)
+        if sig != _state["sig"]:
+            _state["sig"] = sig
+            log.config(state="normal")
+            log.delete("1.0", "end")
+            for e in evs:
+                ts    = time.strftime("%H:%M:%S",
+                                      time.localtime(e.get("time", 0)))
+                topic = str(e.get("topic", "?"))
+                src   = str(e.get("source", "?"))
+                pl    = e.get("payload", {})
+                msg   = ""
+                if isinstance(pl, dict):
+                    msg = pl.get("message", "")
+                    if not msg:
+                        msg = ", ".join(f"{k}={v}"
+                                        for k, v in list(pl.items())[:3])
+                tag = ("err" if topic.startswith("log.error")
+                       else "ok" if topic.startswith("log.")
+                       else "ev")
+                log.insert("end",
+                           f"{ts}  {src:<13.13} {topic:<22.22} {msg}\n", tag)
+            log.see("end")
+            log.config(state="disabled")
+        # Info strip
+        try:
+            i = cosmic.info()
+            host = (i.get("host", {}) or {}).get("host", "?")
+            info_lbl.config(
+                text=f"  Cosmic Core v{i.get('version','?')}   ·   "
+                     f"{i.get('plugins',0)} plugin(s)   ·   host: {host}"
+                     f"   ·   {len(evs)} bus event(s)")
+            root_lbl.config(text=f"  root: {i.get('root','?')}")
+        except Exception:
+            pass
+        win.after(1000, _refresh)
+
+    win.after(150, _refresh)

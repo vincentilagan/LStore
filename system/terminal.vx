@@ -1,0 +1,280 @@
+# VX:name=Terminal
+# VX:icon=⌘
+# VX:version=4.0
+# VX:sig=7iDufYvu3gQ+ZspvO+MWIpWZb3wZajhFpVEA9fvYPf25nqNrfM58vo+3hyrCjFpP3ic7LywZMfzvREMCb+tNCg==
+"""
+Luci Terminal v4
+================
+
+Pure-Qt rewrite of the old Tk-based terminal. The Tk version inherited
+focus issues from running an overrideredirect Toplevel on a no-WM X
+session (Luci's main Qt window held X's keyboard focus and Tk could
+not steal it back reliably). The Qt version uses the SAME toolkit as
+Luci itself, so keyboard focus on the input box "just works" — no
+xdotool dance, no grab_set hacks.
+
+What it gives you
+-----------------
+  • Luci hex traffic-lights (close / minimise / maximise) via the
+    shared LuciWindow base class.
+  • Menu wired into Luci's topbar (File, Edit, View) — same path
+    every other Qt .vx app uses (set_app_menu).
+  • Working command history (Up / Down arrows).
+  • Built-ins: cd, pwd, clear, exit/quit. Everything else is sent
+    to /bin/sh -c with a 60 s timeout.
+  • Copy / paste via menu OR standard Ctrl+C / Ctrl+V shortcuts on
+    the QPlainTextEdit / QLineEdit.
+"""
+
+import os, sys, subprocess
+from importlib.machinery import SourceFileLoader
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_app = SourceFileLoader(
+    "luci_app",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                  "app.vx")).load_module()
+LuciWindow = _app.LuciWindow
+
+from PyQt5.QtCore    import Qt
+from PyQt5.QtGui     import (QFont, QTextCursor, QColor,
+                              QTextCharFormat)
+from PyQt5.QtWidgets import (QPlainTextEdit, QLineEdit, QLabel,
+                              QHBoxLayout, QFileDialog, QApplication)
+
+
+_HOME  = os.path.expanduser("~")
+_SHELL = (["cmd", "/c"] if sys.platform.startswith("win")
+          else ["/bin/sh", "-c"])
+_MONO  = "Consolas" if sys.platform.startswith("win") else "DejaVu Sans Mono"
+
+# Palette — kept simple so the Luci glass chrome stays the visual focus
+COL_OK   = "#cfe4ff"
+COL_DIM  = "#7d99c4"
+COL_ERR  = "#ff6b6b"
+COL_PROM = "#7aff9a"
+
+
+class Terminal(LuciWindow):
+    TITLE = "Terminal"
+    ICON  = "⌘"
+    SIZE  = (780, 480)
+
+    def __init__(self, desktop=None):
+        # State has to exist before build_body() runs — LuciWindow's
+        # __init__ calls build_body() on us.
+        self._cwd     = _HOME
+        self._history = []
+        self._hist_i  = 0
+        # MENU is read by LuciWindow.__init__ → desktop._menubar.set_app_menu.
+        # Each entry is (label, submenu_list). Submenu entries are
+        # (label, callable) — Luci's MenuBar accepts the nested form
+        # and builds a QMenu under the topbar button.
+        # (Self-bound methods resolve correctly here even pre-super()
+        # because Python looks them up on the class at call-time.)
+        self.MENU = [
+            ("File", [
+                ("Clear screen", self._do_clear),
+                ("Save log…",    self._do_save_log),
+                ("-",            None),
+                ("Quit",         self.close),
+            ]),
+            ("Edit", [
+                ("Copy",          self._do_copy),
+                ("Paste",         self._do_paste),
+                ("-",             None),
+                ("Select all",    self._do_select_all),
+            ]),
+            ("View", [
+                ("Increase font", self._do_zoom_in),
+                ("Decrease font", self._do_zoom_out),
+            ]),
+        ]
+        super().__init__(desktop)
+
+    # ── UI ─────────────────────────────────────────────────────────
+    def build_body(self, lay):
+        # Output panel — scrollable, read-only, monospaced
+        self.out = QPlainTextEdit()
+        self.out.setReadOnly(True)
+        self.out.setFont(QFont(_MONO, 10))
+        self.out.setStyleSheet(
+            "QPlainTextEdit {"
+            " background: rgba(6,16,30,200);"
+            f" color: {COL_OK};"
+            " border: 1px solid rgba(255,255,255,30);"
+            " border-radius: 6px;"
+            " padding: 8px;"
+            " selection-background-color: #4c8dff;"
+            " selection-color: #ffffff;"
+            "}")
+        lay.addWidget(self.out, stretch=1)
+
+        # Input row: prompt label + line edit
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.prompt = QLabel(self._prompt_text())
+        self.prompt.setFont(QFont(_MONO, 10, QFont.Bold))
+        self.prompt.setStyleSheet(f"color: {COL_PROM};")
+        row.addWidget(self.prompt)
+
+        self.entry = QLineEdit()
+        self.entry.setFont(QFont(_MONO, 11))
+        self.entry.setStyleSheet(
+            "QLineEdit {"
+            " background: rgba(13,26,46,210);"
+            f" color: {COL_OK};"
+            " border: 1px solid rgba(255,255,255,40);"
+            " border-radius: 5px;"
+            " padding: 6px 10px;"
+            "}"
+            "QLineEdit:focus {"
+            " border-color: #4c8dff;"
+            "}")
+        self.entry.returnPressed.connect(self._run_cmd)
+        row.addWidget(self.entry, stretch=1)
+        lay.addLayout(row)
+
+        # Welcome banner
+        self._write(f"Luci Terminal v4.0  ·  {_SHELL[0]}", COL_DIM)
+        self._write("Type a command and press Enter. Up/Down = history."
+                    "  Built-ins: cd, pwd, clear, exit.", COL_DIM)
+        self._write("", None)
+
+        # Always start with the entry focused — Qt routes keyboard
+        # to whichever widget asks for it, no X11 dance needed.
+        self.entry.setFocus()
+
+    # Re-focus the entry every time the window appears (e.g. after a
+    # workspace swap brings it back). Cheap, harmless.
+    def showEvent(self, e):
+        super().showEvent(e)
+        try: self.entry.setFocus()
+        except Exception: pass
+
+    # ── Helpers ────────────────────────────────────────────────────
+    def _prompt_text(self):
+        cwd = self._cwd
+        if cwd.startswith(_HOME):
+            cwd = "~" + cwd[len(_HOME):]
+        return f" [{cwd}] ❯ "
+
+    def _write(self, text, color=None):
+        cur = self.out.textCursor()
+        cur.movePosition(QTextCursor.End)
+        if color:
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(color))
+            cur.insertText((text or "") + "\n", fmt)
+        else:
+            cur.insertText((text or "") + "\n")
+        self.out.setTextCursor(cur)
+        self.out.ensureCursorVisible()
+
+    # ── Command pipeline ──────────────────────────────────────────
+    def _run_cmd(self):
+        cmd = self.entry.text().strip()
+        self.entry.clear()
+        if not cmd:
+            return
+        self._history.append(cmd)
+        self._hist_i = len(self._history)
+        self._write(f"{self._prompt_text()}{cmd}", COL_PROM)
+
+        parts = cmd.split()
+        verb  = parts[0].lower()
+
+        # Built-ins so cd actually persists (subprocess can't change
+        # the parent's cwd).
+        if verb in ("exit", "quit"):
+            self.close(); return
+        if verb in ("clear", "cls"):
+            self.out.clear(); return
+        if verb == "pwd":
+            self._write(self._cwd, COL_DIM); return
+        if verb == "cd":
+            target = parts[1] if len(parts) > 1 else _HOME
+            target = os.path.expanduser(target)
+            if not os.path.isabs(target):
+                target = os.path.join(self._cwd, target)
+            target = os.path.normpath(target)
+            if os.path.isdir(target):
+                self._cwd = target
+                self.prompt.setText(self._prompt_text())
+            else:
+                self._write(f"cd: no such directory: {target}", COL_ERR)
+            return
+
+        # Everything else: shell out, capture both streams.
+        try:
+            r = subprocess.run(_SHELL + [cmd],
+                                cwd=self._cwd,
+                                capture_output=True, text=True,
+                                timeout=60)
+            if r.stdout:
+                self._write(r.stdout.rstrip("\n"), COL_OK)
+            if r.stderr:
+                self._write(r.stderr.rstrip("\n"), COL_ERR)
+            if r.returncode not in (0, None):
+                self._write(f"[exit {r.returncode}]", COL_DIM)
+        except subprocess.TimeoutExpired:
+            self._write("[timeout — command took longer than 60 s]",
+                         COL_ERR)
+        except Exception as ex:
+            self._write(f"[shell error: {ex}]", COL_ERR)
+
+    # ── History navigation via Up / Down ──────────────────────────
+    def keyPressEvent(self, e):
+        if self.entry.hasFocus() and self._history:
+            if e.key() == Qt.Key_Up:
+                self._hist_i = max(0, self._hist_i - 1)
+                self.entry.setText(self._history[self._hist_i])
+                self.entry.deselect()
+                return
+            if e.key() == Qt.Key_Down:
+                self._hist_i = min(len(self._history),
+                                    self._hist_i + 1)
+                if self._hist_i >= len(self._history):
+                    self.entry.clear()
+                else:
+                    self.entry.setText(self._history[self._hist_i])
+                return
+        super().keyPressEvent(e)
+
+    # ── Menu actions ───────────────────────────────────────────────
+    def _do_clear(self):       self.out.clear()
+    def _do_copy(self):        self.out.copy()
+    def _do_paste(self):       self.entry.paste(); self.entry.setFocus()
+    def _do_select_all(self):  self.out.selectAll()
+
+    def _do_zoom_in(self):
+        f = self.out.font(); f.setPointSize(min(28, f.pointSize() + 1))
+        self.out.setFont(f); self.entry.setFont(QFont(_MONO,
+                                                       f.pointSize()))
+    def _do_zoom_out(self):
+        f = self.out.font(); f.setPointSize(max(6,  f.pointSize() - 1))
+        self.out.setFont(f); self.entry.setFont(QFont(_MONO,
+                                                       f.pointSize()))
+
+    def _do_save_log(self):
+        fn, _ = QFileDialog.getSaveFileName(
+            self, "Save Terminal log", _HOME, "Text (*.txt);;All (*)")
+        if not fn: return
+        try:
+            with open(fn, "w", encoding="utf-8") as f:
+                f.write(self.out.toPlainText())
+            self._write(f"[saved → {fn}]", COL_DIM)
+        except Exception as ex:
+            self._write(f"[save error: {ex}]", COL_ERR)
+
+
+def main(desktop=None):
+    w = Terminal(desktop)
+    w.show()
+    return w
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    main(None)
+    sys.exit(app.exec_())

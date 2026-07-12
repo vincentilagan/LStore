@@ -1,0 +1,438 @@
+# VX:name=appProxy
+# VX:icon=🔌
+# VX:version=3.0
+# VX:author=Vincent Ilagan
+# VX:sig=LOFZf/JqxOP53jldiG2qOCHTSrTU4WOf1tRgIBZ8LtFnMTMmz98odyioIb2y4Ql1LSaUAADSQlBtPCyHk1yYBw==
+
+import tkinter as tk
+import threading, os, sys, json, time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from luci import C, FONT, FONT_BOLD, FONT_SM, lucy_log, ROOT_DIR
+
+_VINX_DIR  = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+_CONN_FILE = os.path.join(ROOT_DIR, ".user", "app_connection.json")
+_PERM_FILE = os.path.join(ROOT_DIR, ".user", "app_permissions.json")
+
+sys.path.insert(0, _VINX_DIR)
+try:
+    import vinx_sysapps as _sa
+    _SYSAPP_OK = True
+except ImportError:
+    _SYSAPP_OK = False
+
+try:
+    import vinx_appcontrol as _ac
+    _CTRL_OK = True
+except ImportError:
+    _CTRL_OK = False
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+_ICONS = {
+    "blender":"🎨","photoshop":"🖼","chrome":"🌐","firefox":"🦊",
+    "vs code":"⌨","code":"⌨","discord":"💬","spotify":"🎵",
+    "obs":"📡","notepad":"📝","excel":"📊","word":"📄",
+    "vlc":"🎬","gimp":"🖌","unity":"🕹","unreal":"🕹",
+}
+
+def _icon(name):
+    n = name.lower()
+    for k, v in _ICONS.items():
+        if k in n: return v
+    return "🖥"
+
+def _write_conn(app_name):
+    os.makedirs(os.path.dirname(_CONN_FILE), exist_ok=True)
+    with open(_CONN_FILE, "w", encoding="utf-8") as f:
+        json.dump({"connected_app": app_name, "ts": time.time()}, f)
+
+def _clear_conn():
+    try: os.remove(_CONN_FILE)
+    except Exception: pass
+
+def _read_conn():
+    try:
+        if os.path.isfile(_CONN_FILE):
+            return json.load(open(_CONN_FILE, encoding="utf-8"))
+    except Exception: pass
+    return {}
+
+def _read_perms():
+    try:
+        if os.path.isfile(_PERM_FILE):
+            return json.load(open(_PERM_FILE, encoding="utf-8"))
+    except Exception: pass
+    return {}
+
+def _write_perm(app_name, allowed: bool):
+    os.makedirs(os.path.dirname(_PERM_FILE), exist_ok=True)
+    perms = _read_perms()
+    perms[app_name.lower()] = allowed
+    with open(_PERM_FILE, "w", encoding="utf-8") as f:
+        json.dump(perms, f, indent=2)
+
+def _has_perm(app_name):
+    return _read_perms().get(app_name.lower(), False)
+
+# ── Permission dialog ─────────────────────────────────────────────────────────
+
+def _show_permission_dialog(root_win, app_name, ico, on_allow, on_deny):
+    dlg = tk.Toplevel(root_win)
+    dlg.overrideredirect(True)
+    dlg.configure(bg="#0a0a1a")
+    sw, sh = root_win.winfo_screenwidth(), root_win.winfo_screenheight()
+    w, h = 420, 220
+    dlg.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+    dlg.lift()
+    dlg.grab_set()
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    hdr = tk.Frame(dlg, bg="#1a0a3a", height=36)
+    hdr.pack(fill="x"); hdr.pack_propagate(False)
+    _close_ref = [None]  # filled after _deny is defined
+    tk.Label(hdr, text="  🔐  Permission Request",
+             bg="#1a0a3a", fg="#bb88ff", font=FONT_BOLD).pack(side="left", fill="y")
+    tk.Button(hdr, text="✕", bg="#1a0a3a", fg=C["dim"],
+              activebackground=C["red"], activeforeground="white",
+              font=FONT_BOLD, relief="flat", bd=0, padx=10,
+              command=lambda: _close_ref[0]()).pack(side="right", fill="y")
+
+    # ── App icon + name ───────────────────────────────────────────────────────
+    mid = tk.Frame(dlg, bg="#0a0a1a")
+    mid.pack(fill="both", expand=True, padx=20, pady=10)
+
+    tk.Label(mid, text=ico, bg="#0a0a1a", fg="white",
+             font=("Segoe UI", 38)).pack()
+    tk.Label(mid, text=app_name.title(),
+             bg="#0a0a1a", fg="white", font=FONT_BOLD).pack()
+    tk.Label(mid,
+             text="Allow VinX to read, focus, and\nsend commands to this app?",
+             bg="#0a0a1a", fg=C["dim"], font=("Segoe UI", 9),
+             justify="center").pack(pady=(4, 0))
+
+    # ── Buttons ───────────────────────────────────────────────────────────────
+    btn_row = tk.Frame(dlg, bg="#0a0a1a")
+    btn_row.pack(fill="x", padx=20, pady=(0, 16))
+
+    def _deny():
+        dlg.grab_release(); dlg.destroy()
+        on_deny()
+    _close_ref[0] = _deny
+
+    def _allow():
+        dlg.grab_release(); dlg.destroy()
+        on_allow()
+
+    tk.Button(btn_row, text="✕  Deny", bg="#2a0a0a", fg="#ff6666",
+              font=FONT_SM, relief="flat", bd=0, padx=16, pady=6,
+              activebackground="#3a1010",
+              command=_deny).pack(side="left", expand=True, fill="x", padx=(0, 6))
+
+    tk.Button(btn_row, text="✔  Allow Control", bg="#0a2a0a", fg="#66ff88",
+              font=FONT_SM, relief="flat", bd=0, padx=16, pady=6,
+              activebackground="#1a4a1a",
+              command=_allow).pack(side="right", expand=True, fill="x")
+
+    dlg.lift()
+
+# ── Picker ────────────────────────────────────────────────────────────────────
+
+def _pick_app(root_win, on_pick):
+    dlg = tk.Toplevel(root_win)
+    dlg.overrideredirect(True)
+    dlg.configure(bg=C["border"])
+    sw, sh = root_win.winfo_screenwidth(), root_win.winfo_screenheight()
+    w, h = 320, 400
+    dlg.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+    dlg.lift()
+
+    hdr = tk.Frame(dlg, bg=C["win_title"], height=32)
+    hdr.pack(fill="x"); hdr.pack_propagate(False)
+    tk.Label(hdr, text="  🔌  Connect to which app?",
+             bg=C["win_title"], fg=C["accent2"], font=FONT_BOLD).pack(side="left", fill="y")
+    tk.Button(hdr, text="✕", bg=C["win_title"], fg=C["dim"],
+              activebackground=C["red"], font=FONT_BOLD,
+              relief="flat", bd=0, padx=10, command=dlg.destroy).pack(side="right", fill="y")
+
+    sv = tk.StringVar()
+    tk.Entry(dlg, textvariable=sv, bg=C["border"], fg=C["text"],
+             font=FONT, insertbackground="white", relief="flat", bd=6
+             ).pack(fill="x", padx=6, pady=6)
+
+    lb = tk.Listbox(dlg, bg="#080f1f", fg=C["text"], font=("Segoe UI", 10),
+                    selectbackground=C["accent"], relief="flat", bd=0,
+                    highlightthickness=0, activestyle="none")
+    lb.pack(fill="both", expand=True, padx=4)
+
+    _all = []
+
+    def _fill(*_):
+        q = sv.get().lower()
+        lb.delete(0, "end")
+        for n in _all:
+            if not q or q in n:
+                lb.insert("end", f"  {_icon(n)}  {n.title()}")
+
+    def _load():
+        names = _sa.list_all() if _SYSAPP_OK else [
+            "blender","chrome","firefox","notepad",
+            "vs code","discord","spotify","photoshop","obs",
+        ]
+        _all.extend(names)
+        dlg.after(0, _fill)
+
+    sv.trace_add("write", _fill)
+    threading.Thread(target=_load, daemon=True).start()
+
+    def _select(_=None):
+        sel = lb.curselection()
+        if not sel: return
+        raw  = lb.get(sel[0]).strip()
+        name = raw.split("  ", 2)[-1].lower().strip()
+        dlg.destroy()
+        on_pick(name)
+
+    lb.bind("<Double-Button-1>", _select)
+    tk.Button(dlg, text="Connect to VinX  🔗", bg=C["accent"], fg="white",
+              font=FONT_SM, relief="flat", bd=0, padx=12, pady=6,
+              activebackground=C["accent2"],
+              command=_select).pack(fill="x", padx=6, pady=6)
+
+# ── Build proxy card ──────────────────────────────────────────────────────────
+
+_IS_BLENDER_APP = lambda name: "blender" in name.lower()
+
+def _build(desktop, app_name):
+    ico = _icon(app_name)
+    is_blender = _IS_BLENDER_APP(app_name)
+    w, h = 260, (148 if is_blender else 110)
+    sw, sh = desktop.root.winfo_screenwidth(), desktop.root.winfo_screenheight()
+    offset = len(desktop._windows) * 24
+    x = max(0, (sw - w) // 2 + offset)
+    y = max(30, (sh - h) // 2 + offset)
+
+    win = tk.Toplevel(desktop.root)
+    win.overrideredirect(True)
+    win.configure(bg=C["border"])
+    win.geometry(f"{w}x{h}+{x}+{y}")
+    win.attributes("-topmost", False)
+    win.lift()
+
+    # ── Title bar ─────────────────────────────────────────────────────────────
+    # ── Title bar (global Luci chrome) ─────────────────────────────
+    if hasattr(desktop, "apply_chrome"):
+        desktop.apply_chrome(win, title="App",
+                              icon="📦", include_body=False)
+    else:
+        bar = tk.Frame(win, bg=C["win_title"], height=28)
+        bar.pack(fill="x"); bar.pack_propagate(False)
+        tk.Label(bar, text=f"  {ico}  {app_name.title()}",
+                 bg=C["win_title"], fg=C["text"], font=FONT_SM).pack(side="left", fill="y")
+        def _close_proxy():
+            _clear_conn()   # drop connection before window dies
+            win.destroy()
+        tk.Button(bar, text="✕", bg=C["win_title"], fg=C["dim"],
+                  activebackground=C["red"], font=FONT_SM,
+                  relief="flat", bd=0, padx=8,
+                  command=_close_proxy).pack(side="right", fill="y")
+    
+        port = desktop.add_port(win, app_name)
+        port.pack(side="right", fill="y")
+    
+        drag = [None]
+        bar.bind("<ButtonPress-1>", lambda e: drag.__setitem__(0,(e.x_root-win.winfo_x(),e.y_root-win.winfo_y())))
+        bar.bind("<B1-Motion>",     lambda e: win.geometry(f"+{e.x_root-drag[0][0]}+{e.y_root-drag[0][1]}") if drag[0] else None)
+
+    # ── Body ──────────────────────────────────────────────────────────────────
+    body = tk.Frame(win, bg=C["win_bg"])
+    body.pack(fill="both", expand=True, padx=1, pady=(0,1))
+
+    status_lbl = tk.Label(body, text="", bg=C["win_bg"],
+                          fg=C["dim"], font=("Segoe UI", 8), anchor="w")
+    status_lbl.pack(fill="x", padx=6, pady=(4,0))
+
+    perm_lbl = tk.Label(body, text="", bg=C["win_bg"],
+                        fg=C["dim"], font=("Segoe UI", 8), anchor="w")
+    perm_lbl.pack(fill="x", padx=6)
+
+    _connected = [False]
+    _permitted = [_has_perm(app_name)]
+
+    def _refresh_perm_label():
+        if _connected[0]:
+            if _permitted[0]:
+                perm_lbl.config(text="  🟢 VinX can control this app", fg="#66ff88")
+            else:
+                perm_lbl.config(text="  🔒 Control not permitted — click to allow",
+                                fg="#ffaa44")
+        else:
+            perm_lbl.config(text="")
+
+    def _on_allow():
+        _permitted[0] = True
+        _write_perm(app_name, True)
+        _refresh_perm_label()
+        desktop._toast(f"VinX now has control of {app_name} ✔")
+        lucy_log("APPPROXY", f"Permission GRANTED: {app_name}")
+
+    def _on_deny():
+        _permitted[0] = False
+        _write_perm(app_name, False)
+        _refresh_perm_label()
+        desktop._toast(f"Control denied for {app_name}")
+        lucy_log("APPPROXY", f"Permission DENIED: {app_name}")
+
+    def _ask_permission():
+        _show_permission_dialog(desktop.root, app_name, ico, _on_allow, _on_deny)
+
+    perm_lbl.bind("<Button-1>", lambda _: _ask_permission() if _connected[0] and not _permitted[0] else None)
+
+    def _connect():
+        _write_conn(app_name)
+        _connected[0] = True
+        conn_btn.config(text="🔗  Connected to VinX ✓",
+                        bg="#003322", fg="#00ffaa",
+                        activebackground="#005533",
+                        command=_disconnect)
+        desktop._toast(f"VinX wired to {app_name}! 🔗")
+        lucy_log("APPPROXY", f"Connected: {app_name}")
+        _try_auto_wire()
+        # Show permission dialog if not already granted
+        if not _permitted[0]:
+            win.after(400, _ask_permission)
+        _refresh_perm_label()
+
+    def _disconnect():
+        _clear_conn()
+        _connected[0] = False
+        conn_btn.config(text="🔗  Connect to VinX",
+                        bg=C["accent"], fg="white",
+                        activebackground=C["accent2"],
+                        command=_connect)
+        desktop._toast(f"VinX disconnected from {app_name}")
+        _refresh_perm_label()
+
+    def _try_auto_wire():
+        win_id = id(win)
+        for other_id, info in desktop._ports.items():
+            if info.get("label", "").lower() in ("vinxnode", "vinx node", "vinx"):
+                if other_id not in desktop._port_connections:
+                    desktop._make_port_connection(win_id, other_id)
+                    break
+
+    conn_btn = tk.Button(body, text="🔗  Connect to VinX",
+                         bg=C["accent"], fg="white",
+                         font=FONT_SM, relief="flat", bd=0, padx=8, pady=4,
+                         activebackground=C["accent2"],
+                         command=_connect)
+    conn_btn.pack(fill="x", padx=6, pady=(2,2))
+
+    # ── Blender: addon install + bridge status ────────────────────────────────
+    if is_blender:
+        _addon_src = os.path.join(_VINX_DIR, "vinx_blender_addon.py")
+        _mem_dir   = os.path.join(_VINX_DIR, "memory")
+        _state_file= os.path.join(_mem_dir,  "blender_state.json")
+
+        addon_lbl = tk.Label(body, text="  ⚪  addon not detected",
+                             bg=C["win_bg"], fg=C["dim"],
+                             font=("Segoe UI", 8), anchor="w")
+        addon_lbl.pack(fill="x", padx=6)
+
+        def _install_addon():
+            import shutil, glob as _g, subprocess as _sp
+            roaming = os.path.join(os.environ.get("APPDATA", ""), "Blender Foundation", "Blender")
+            # Find all version folders that have a scripts/addons subfolder
+            candidates = _g.glob(os.path.join(roaming, "*", "scripts", "addons"))
+            if not candidates:
+                # Try creating the folder for the newest version found
+                ver_dirs = _g.glob(os.path.join(roaming, "*"))
+                if ver_dirs:
+                    newest = max(ver_dirs, key=os.path.getmtime)
+                    candidates = [os.path.join(newest, "scripts", "addons")]
+                    os.makedirs(candidates[0], exist_ok=True)
+            if not candidates:
+                desktop._toast("❌ Blender addons folder not found")
+                return
+            # Install into NEWEST Blender version (highest version number)
+            dest_dir = max(candidates)
+            dest = os.path.join(dest_dir, "vinx_blender_addon.py")
+            shutil.copy2(_addon_src, dest)
+            desktop._toast(f"✔ Installed! Restart Blender → Edit → Preferences → Add-ons → search 'VinX'")
+            lucy_log("APPPROXY", f"Blender addon installed: {dest}")
+            # Open the addons folder in Explorer so user can verify
+            _sp.Popen(["explorer", dest_dir])
+
+        tk.Button(body, text="🔧  Install VinX Addon in Blender",
+                  bg="#1a0a00", fg="#ffaa44",
+                  font=("Segoe UI", 8), relief="flat", bd=0, padx=6, pady=3,
+                  activebackground="#2a1a00",
+                  command=lambda: threading.Thread(target=_install_addon, daemon=True).start()
+                  ).pack(fill="x", padx=6, pady=(0,3))
+
+        def _poll_addon():
+            if not win.winfo_exists(): return
+            import time as _t, json as _j
+            try:
+                if os.path.isfile(_state_file):
+                    s = _j.load(open(_state_file, encoding="utf-8"))
+                    age = _t.time() - s.get("ts", 0)
+                    if age < 4:
+                        nobjs = len(s.get("objects", []))
+                        addon_lbl.config(
+                            text=f"  🟢  Bridge active · {nobjs} obj(s) in scene",
+                            fg="#66ff88")
+                    else:
+                        addon_lbl.config(text="  🟡  Addon installed, Blender not open",
+                                         fg="#ffcc44")
+                else:
+                    addon_lbl.config(text="  ⚪  Addon not detected", fg=C["dim"])
+            except Exception:
+                pass
+            win.after(1000, _poll_addon)
+
+        win.after(500, _poll_addon)
+
+    # ── Status polling ────────────────────────────────────────────────────────
+    def _poll():
+        if not win.winfo_exists(): return
+        running = False
+        if _CTRL_OK:
+            hwnd, _ = _ac.find_window(app_name)
+            running = hwnd is not None
+        status_lbl.config(
+            text=f"  {'🟢 running' if running else '🔴 not running'}",
+            fg=C["green"] if running else C["dim"])
+        conn = _read_conn()
+        file_app = conn.get("connected_app", "")
+        if file_app == app_name and not _connected[0]:
+            _connected[0] = True
+            conn_btn.config(text="🔗  Connected to VinX ✓",
+                            bg="#003322", fg="#00ffaa",
+                            activebackground="#005533",
+                            command=_disconnect)
+        elif file_app != app_name and _connected[0]:
+            _connected[0] = False
+            conn_btn.config(text="🔗  Connect to VinX",
+                            bg=C["accent"], fg="white",
+                            activebackground=C["accent2"],
+                            command=_connect)
+        _refresh_perm_label()
+        win.after(1500, _poll)
+
+    win.after(300, _poll)
+
+    prev = _read_conn()
+    if prev.get("connected_app", "").lower() == app_name.lower():
+        win.after(400, _connect)
+
+    lucy_log("APPPROXY", f"Proxy card: {app_name}")
+
+
+# ── Entry points ──────────────────────────────────────────────────────────────
+
+def main(desktop, app_name=None):
+    if app_name:
+        _build(desktop, app_name)
+    else:
+        _pick_app(desktop.root, lambda name: _build(desktop, name))

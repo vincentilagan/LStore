@@ -1,0 +1,228 @@
+# VX:name=Volume
+# VX:icon=🔊
+# VX:version=1.0
+# VX:sig=rFUTsytOCgsSf4An1UUYonw+QJX8W6vnNzbVOVNPv1fZmMxOe7C2CohJtDe3tvUGzouKc8hnHe/ZwVbON9I8Cg==
+"""
+Luci Volume — small floating control panel.
+
+Renders a node-style slider (glowing track + circular knob), mute
+toggle, and quick presets. Reads + writes the system mixer:
+    FreeBSD : `mixer vol <0-100>` / `mixer vol mute`
+    Windows : SendKeys VOLUME_UP / VOLUME_DOWN / VOLUME_MUTE
+
+Auto-positions in the top-right corner under the menubar. Click outside
+the panel closes it (toast-style ephemeral UI).
+"""
+
+import os, sys, subprocess, tkinter as tk
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from luci import C
+
+_IS_WIN = sys.platform.startswith("win")
+
+
+# ── Mixer I/O ───────────────────────────────────────────────────────────────
+def _read_volume() -> int:
+    """Return current volume 0-100. Best-effort; falls back to 50."""
+    try:
+        if _IS_WIN:
+            ps = (
+                "[Audio]::Volume; class Audio {static [int] Volume() {"
+                "Add-Type -AssemblyName presentationCore;"
+                "$d = New-Object -ComObject WScript.Shell;"
+                "return 50}}"
+            )
+            return 50
+        else:
+            out = subprocess.run(["mixer", "vol"], capture_output=True,
+                                  text=True, timeout=2)
+            # FreeBSD 15 mixer(8): "vol.volume=0.85:0.85" (float 0.0-1.0).
+            import re
+            m = re.search(r"vol\.volume\s*=\s*([\d.]+)", out.stdout or "")
+            if m:
+                return int(round(float(m.group(1)) * 100))
+    except Exception:
+        pass
+    return 50
+
+
+def _set_volume(level: int):
+    level = max(0, min(100, int(level)))
+    try:
+        if _IS_WIN:
+            # Approximate via repeated key events (each tap ≈ 2%)
+            cur = _read_volume()
+            delta = level - cur
+            taps = abs(delta) // 2
+            key = "{VOLUME_UP}" if delta > 0 else "{VOLUME_DOWN}"
+            if taps > 0:
+                subprocess.Popen([
+                    "powershell", "-NoProfile", "-Command",
+                    f"$s = New-Object -ComObject WScript.Shell; "
+                    f"1..{taps} | %{{ $s.SendKeys('{key}') }}"])
+        else:
+            # FreeBSD 15 mixer(8): values are FLOAT 0.0-1.0 with `dev=value`
+            # syntax (the old `mixer vol 30` did nothing). Set BOTH the master
+            # (vol) and the PCM stream (pcm) — playback like Chrome/YouTube
+            # rides on `pcm`, so `vol` alone never silenced it.
+            f = "%.2f" % (level / 100.0)
+            subprocess.run(["mixer", "vol=%s" % f, "pcm=%s" % f,
+                            "vol.mute=0", "pcm.mute=0"],
+                           capture_output=True, timeout=2)
+    except Exception:
+        pass
+
+
+def _set_mute(muted: bool):
+    try:
+        if _IS_WIN:
+            subprocess.Popen([
+                "powershell", "-NoProfile", "-Command",
+                "(New-Object -ComObject WScript.Shell).SendKeys('{VOLUME_MUTE}')"])
+        else:
+            v = "1" if muted else "0"
+            subprocess.run(["mixer", "vol.mute=%s" % v, "pcm.mute=%s" % v],
+                           capture_output=True, timeout=2)
+    except Exception:
+        pass
+
+
+# ── UI ──────────────────────────────────────────────────────────────────────
+def main(desktop):
+    win = tk.Toplevel(desktop.root)
+    win.overrideredirect(True)
+    W, H = 280, 150
+    sw = win.winfo_screenwidth()
+    # Top-right, just under the 26 px menu bar
+    win.geometry(f"{W}x{H}+{sw - W - 12}+{30}")
+    try: win.attributes("-topmost", True)
+    except Exception: pass
+
+    BG     = "#0b1322"
+    PANEL  = "#0d1a30"
+    TRACK  = "#1f2d4a"
+    GLOW   = C.get("accent",  "#5ec8ff")
+    TEXT   = "#cfe4ff"
+    DIM    = "#7d99c4"
+    win.configure(bg=BG, highlightbackground="#1f2d4a",
+                  highlightthickness=1)
+
+    state = {"vol": _read_volume(), "muted": False}
+
+    # Header
+    head = tk.Frame(win, bg=BG)
+    head.pack(fill="x", padx=14, pady=(10, 4))
+    icon_lbl = tk.Label(head, text="🔊", bg=BG, fg=TEXT,
+                         font=("Segoe UI Emoji", 16),
+                         cursor="hand2")
+    icon_lbl.pack(side="left")
+
+    # Close (×) — explicit close button, since <FocusOut> is
+    # unreliable on overrideredirect Toplevels in some WMs.
+    def _close():
+        try:
+            win.destroy()
+        except Exception:
+            pass
+
+    close_btn = tk.Label(head, text="×", bg=BG, fg=DIM,
+                         font=("Segoe UI", 14, "bold"),
+                         cursor="hand2", padx=6)
+    close_btn.pack(side="right")
+    close_btn.bind("<Button-1>", lambda _e: _close())
+    close_btn.bind("<Enter>", lambda _e: close_btn.config(fg=TEXT))
+    close_btn.bind("<Leave>", lambda _e: close_btn.config(fg=DIM))
+
+    val_lbl = tk.Label(head, text=f"{state['vol']}%",
+                        bg=BG, fg=DIM,
+                        font=("Segoe UI", 10))
+    val_lbl.pack(side="right", padx=(0, 8))
+
+    # ── Node-style slider on a Canvas ────────────────────────────────────
+    cv = tk.Canvas(win, bg=BG, highlightthickness=0, height=42)
+    cv.pack(fill="x", padx=14)
+    PAD = 12
+
+    def _draw(_e=None):
+        cv.delete("all")
+        w = cv.winfo_width() or (W - 28)
+        h = cv.winfo_height() or 42
+        cy = h // 2
+        # Inactive track
+        cv.create_line(PAD, cy, w - PAD, cy, fill=TRACK, width=4,
+                       capstyle="round")
+        # Active glow track
+        v = state["vol"] / 100
+        knob_x = PAD + (w - PAD * 2) * v
+        cv.create_line(PAD, cy, knob_x, cy, fill=GLOW, width=4,
+                       capstyle="round")
+        # Soft glow halo around knob
+        for r, alpha in ((14, "#1a3a55"), (10, "#2c5b80"), (8, GLOW)):
+            cv.create_oval(knob_x - r, cy - r,
+                            knob_x + r, cy + r,
+                            fill=alpha, outline="")
+        # Solid knob
+        cv.create_oval(knob_x - 6, cy - 6, knob_x + 6, cy + 6,
+                       fill="#ffffff", outline="")
+    cv.bind("<Configure>", _draw)
+    win.after(40, _draw)
+
+    def _refresh(new_vol):
+        state["vol"] = max(0, min(100, int(new_vol)))
+        val_lbl.config(text=f"{state['vol']}%")
+        # Icon updates with level
+        if state["vol"] == 0 or state["muted"]:
+            icon_lbl.config(text="🔇")
+        elif state["vol"] < 33:
+            icon_lbl.config(text="🔈")
+        elif state["vol"] < 66:
+            icon_lbl.config(text="🔉")
+        else:
+            icon_lbl.config(text="🔊")
+        _draw()
+
+    def _seek(e):
+        w = cv.winfo_width()
+        x = max(PAD, min(w - PAD, e.x))
+        v = (x - PAD) / (w - PAD * 2) * 100
+        _refresh(v)
+        _set_volume(state["vol"])
+    cv.bind("<Button-1>", _seek)
+    cv.bind("<B1-Motion>", _seek)
+
+    # Mute toggle
+    def _mute():
+        state["muted"] = not state["muted"]
+        _set_mute(state["muted"])
+        _refresh(state["vol"])
+    icon_lbl.bind("<Button-1>", lambda _e: _mute())
+
+    # Quick presets
+    presets = tk.Frame(win, bg=BG)
+    presets.pack(fill="x", padx=14, pady=(8, 12))
+    def _make_preset(label, val):
+        b = tk.Label(presets, text=label, bg=PANEL, fg=TEXT,
+                      font=("Segoe UI", 9), padx=8, pady=4,
+                      cursor="hand2")
+        b.pack(side="left", padx=2)
+        b.bind("<Button-1>", lambda _e: (_refresh(val), _set_volume(val)))
+        return b
+    for lbl, v in (("0%", 0), ("25%", 25), ("50%", 50),
+                    ("75%", 75), ("100%", 100)):
+        _make_preset(lbl, v)
+
+    # Close on Escape always works (window-level binding)
+    win.bind("<Escape>", lambda _e: _close())
+
+    # NOTE: previous versions wired a root <Button-1> binding that
+    # tried to unbind itself on <Destroy>. Tcl raised "can't delete
+    # Tcl command" errors thousands of times because the funcid was
+    # invalid by the time the destroy event fired — eventually the
+    # Tk interpreter wedged and X went down. We rely on the explicit
+    # × close button + Escape + the menubar toggle now.
+
+    try: win.focus_force()
+    except Exception: pass
+
+    return win

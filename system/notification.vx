@@ -1,0 +1,316 @@
+# VX:name=Notifications
+# VX:icon=🔔
+# VX:version=1.0
+# VX:sig=YXv5/q+a2sPjYlRT7btkLn6X9Qfl/u6RMqFNzPD6mn7iMvc0P2AoDnVZ75SYF433V4VS7ZL69v8zcVRPLea0BA==
+"""
+Luci Notifications — animated glass toast / progress cards.
+
+Public API
+==========
+  toast(title, body=None, kind="info", duration=3500)
+      Slide-in glass card top-right with optional body line. Auto-
+      dismisses after `duration` ms.
+
+  progress(title, name="")
+      Returns a ProgressCard handle. Caller updates it from any
+      thread:
+        card.set(0.42, "current-file.txt")
+        card.done()        # smooth completion + fade-out
+
+Cards auto-stack vertically along the right edge so multiple
+concurrent operations stay readable.
+
+Why a separate .vx?
+-------------------
+Earlier the copy progress lived inside the FileManager window as a
+strip across the bottom — fine for one copy, but it covered file
+icons and only one window could ever show it. Spinning the
+notification system out into its own module means *every* Luci app
+can fire a toast or progress card the same way, and the cards float
+above the desktop like a real notification centre.
+"""
+
+import os, sys, math
+from PyQt5.QtCore    import (Qt, QTimer, QRectF, QPointF,
+                              QPropertyAnimation, QEasingCurve,
+                              pyqtProperty, pyqtSignal, QObject)
+from PyQt5.QtGui     import (QFont, QColor, QPainter, QPen, QBrush,
+                              QPainterPath, QLinearGradient,
+                              QRadialGradient, QGuiApplication)
+from PyQt5.QtWidgets import (QWidget, QApplication)
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+try:
+    from luci import C, _qfont, _UI_FAM
+except Exception:
+    C = {"accent":"#5ec8ff","text":"#ffffff","dim":"#7d99c4"}
+    _UI_FAM = "Segoe UI"
+    def _qfont(fam, size, bold=False):
+        f = QFont(fam, size); f.setBold(bold); return f
+
+
+# ── Stack manager (one per process) ───────────────────────────────────
+class _Stack:
+    """Tracks active notification cards so they can stack vertically
+    without overlapping. Cards register on show, deregister on hide."""
+
+    def __init__(self):
+        self._cards = []
+        self._margin = 18
+        self._gap    = 10
+
+    def register(self, card):
+        self._cards.append(card)
+        self._relayout()
+
+    def deregister(self, card):
+        try: self._cards.remove(card)
+        except ValueError: pass
+        self._relayout()
+
+    def _relayout(self):
+        scr = QGuiApplication.primaryScreen().geometry()
+        y = scr.top() + 40   # leave room for menubar
+        for c in list(self._cards):
+            try:
+                if not c.isVisible(): continue
+                x = scr.right() - c.width() - self._margin
+                c._target_pos = (x, y)
+                c._slide_to(x, y)
+                y += c.height() + self._gap
+            except Exception:
+                pass
+
+
+_STACK = _Stack()
+
+
+# ── Base card ─────────────────────────────────────────────────────────
+class _Card(QWidget):
+    """Frameless glass card that slides in from the right edge."""
+
+    DEFAULT_SIZE = (320, 80)
+
+    def __init__(self):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.Tool
+                          | Qt.WindowStaysOnTopHint)
+        w, h = self.DEFAULT_SIZE
+        self.resize(w, h)
+        self._target_pos = (0, 0)
+        # We DON'T use WA_TranslucentBackground because Luci runs
+        # without a compositor on the test rig; painted-glass via
+        # paintEvent keeps the look identical without the X stipple
+        # artefacts that translucent QWidgets show without picom.
+        self._slide_anim = QPropertyAnimation(self, b"pos")
+        self._slide_anim.setDuration(280)
+        self._slide_anim.setEasingCurve(QEasingCurve.OutCubic)
+
+    def show_in_stack(self):
+        scr = QGuiApplication.primaryScreen().geometry()
+        # Start off-screen on the right
+        start_x = scr.right() + 20
+        start_y = scr.top() + 40 + len(_STACK._cards) * (self.height() + 10)
+        self.move(start_x, start_y)
+        self.show(); self.raise_()
+        _STACK.register(self)
+
+    def _slide_to(self, x, y):
+        try:
+            from PyQt5.QtCore import QPoint
+            self._slide_anim.stop()
+            self._slide_anim.setStartValue(self.pos())
+            self._slide_anim.setEndValue(QPoint(x, y))
+            self._slide_anim.start()
+        except Exception:
+            self.move(x, y)
+
+    def dismiss(self):
+        """Slide off-screen to the right then close."""
+        scr = QGuiApplication.primaryScreen().geometry()
+        x = scr.right() + 20
+        try:
+            from PyQt5.QtCore import QPoint
+            self._slide_anim.stop()
+            self._slide_anim.setStartValue(self.pos())
+            self._slide_anim.setEndValue(QPoint(x, self.y()))
+            self._slide_anim.start()
+            self._slide_anim.finished.connect(self._on_dismissed)
+        except Exception:
+            self._on_dismissed()
+
+    def _on_dismissed(self):
+        try: _STACK.deregister(self)
+        except Exception: pass
+        self.close()
+
+    def closeEvent(self, e):
+        try: _STACK.deregister(self)
+        except Exception: pass
+        super().closeEvent(e)
+
+    def mousePressEvent(self, e):
+        # Click anywhere on the card dismisses it
+        if e.button() == Qt.LeftButton:
+            self.dismiss()
+
+    # ── Glass chrome shared by all cards ─────────────────────────
+    def _paint_chrome(self, p, accent_rgb=(94, 200, 255)):
+        r = self.rect().adjusted(0, 0, -1, -1)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(r), 14, 14)
+        # Dark glass fill — opaque-but-glassy gradient
+        grad = QLinearGradient(0, 0, 0, self.height())
+        grad.setColorAt(0.0, QColor(14, 26, 56, 245))
+        grad.setColorAt(1.0, QColor(6,  14, 32, 245))
+        p.fillPath(path, grad)
+        # Top sheen
+        sheen = QLinearGradient(0, 0, 0, self.height() * 0.4)
+        sheen.setColorAt(0.0, QColor(255, 255, 255, 38))
+        sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.fillPath(path, sheen)
+        # Accent left-edge stripe
+        ar, ag, ab = accent_rgb
+        stripe = QPainterPath()
+        stripe.addRect(0, 0, 3, self.height())
+        p.fillPath(stripe, QColor(ar, ag, ab, 240))
+        # Outer border
+        pen = QPen(QColor(255, 255, 255, 60)); pen.setWidth(1)
+        p.setPen(pen); p.setBrush(Qt.NoBrush); p.drawPath(path)
+
+
+# ── Toast (title + optional body, auto-dismiss) ───────────────────────
+class _Toast(_Card):
+    KIND_COLORS = {
+        "info":    (94, 200, 255),
+        "ok":      (110, 220, 140),
+        "warn":    (255, 184, 74),
+        "error":   (255, 91, 107),
+    }
+
+    def __init__(self, title, body=None, kind="info", duration=3500):
+        super().__init__()
+        self._title = title
+        self._body  = body or ""
+        self._accent = self.KIND_COLORS.get(kind, self.KIND_COLORS["info"])
+        QTimer.singleShot(duration, self.dismiss)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        self._paint_chrome(p, self._accent)
+        p.setFont(_qfont(_UI_FAM, 11, bold=True))
+        p.setPen(QPen(QColor(245, 250, 255)))
+        p.drawText(QRectF(18, 12, self.width() - 28, 22),
+                    Qt.AlignLeft | Qt.AlignVCenter, self._title)
+        if self._body:
+            p.setFont(_qfont(_UI_FAM, 9))
+            p.setPen(QPen(QColor(190, 215, 240, 220)))
+            p.drawText(QRectF(18, 38, self.width() - 28, 34),
+                        Qt.AlignLeft | Qt.AlignTop, self._body)
+
+
+# ── Progress card (flowing dots until done) ───────────────────────────
+class ProgressCard(_Card):
+    DEFAULT_SIZE = (340, 88)
+
+    def __init__(self, title, name=""):
+        super().__init__()
+        self._title    = title
+        self._name     = name
+        self._progress = 0.0
+        self._dot_phase = 0.0
+        self._done = False
+        self._tm = QTimer(self); self._tm.timeout.connect(self._tick)
+        self._tm.start(33)
+
+    def set(self, frac, name=None):
+        """Thread-safe-ish: just stores state; QTimer drives repaint."""
+        self._progress = max(0.0, min(1.0, float(frac)))
+        if name is not None: self._name = name
+
+    def done(self):
+        """Smooth fade-then-dismiss when the operation is complete."""
+        self._progress = 1.0
+        self._done = True
+        QTimer.singleShot(900, self.dismiss)
+
+    def _tick(self):
+        self._dot_phase += 0.07
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        self._paint_chrome(p, (110, 220, 140))
+
+        # Title
+        p.setFont(_qfont(_UI_FAM, 11, bold=True))
+        p.setPen(QPen(QColor(245, 250, 255)))
+        p.drawText(QRectF(18, 10, self.width() - 28, 20),
+                    Qt.AlignLeft | Qt.AlignVCenter, self._title)
+        # Current file (smaller, dim)
+        p.setFont(_qfont(_UI_FAM, 9))
+        p.setPen(QPen(QColor(190, 215, 240, 220)))
+        nm = self._name
+        if len(nm) > 40: nm = nm[:38] + "…"
+        p.drawText(QRectF(18, 30, self.width() - 80, 18),
+                    Qt.AlignLeft | Qt.AlignVCenter, nm)
+        # Percent on the right
+        p.setFont(_qfont(_UI_FAM, 9, bold=True))
+        p.setPen(QPen(QColor(190, 230, 200, 230)))
+        p.drawText(QRectF(self.width() - 60, 30, 42, 18),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    f"{int(self._progress * 100)}%")
+
+        # Flowing dots bar
+        bar_x0, bar_x1, bar_y = 18, self.width() - 18, self.height() - 18
+        bar_w = bar_x1 - bar_x0
+        pen = QPen(QColor(255, 255, 255, 55)); pen.setWidth(2)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen); p.drawLine(bar_x0, bar_y, bar_x1, bar_y)
+        head_x = bar_x0 + bar_w * self._progress
+        accent = QColor(110, 220, 140)
+        N = 4
+        for i in range(N):
+            phase = (self._dot_phase * 0.6 + i / N) % 1.0
+            dot_x = bar_x0 + (head_x - bar_x0) * phase
+            alpha = int(255 * (0.25 + 0.75 * phase))
+            for (r, a_scale) in ((9, 0.20), (5, 0.55)):
+                grad = QRadialGradient(dot_x, bar_y, r)
+                grad.setColorAt(0, QColor(accent.red(), accent.green(),
+                                           accent.blue(),
+                                           int(alpha * a_scale)))
+                grad.setColorAt(1, QColor(accent.red(), accent.green(),
+                                           accent.blue(), 0))
+                p.setBrush(grad); p.setPen(Qt.NoPen)
+                p.drawEllipse(QPointF(dot_x, bar_y), r, r)
+            p.setBrush(QColor(245, 255, 250, alpha))
+            p.drawEllipse(QPointF(dot_x, bar_y), 2.5, 2.5)
+
+
+# ── Public helpers ────────────────────────────────────────────────────
+def toast(title, body=None, kind="info", duration=3500):
+    t = _Toast(title, body=body, kind=kind, duration=duration)
+    t.show_in_stack()
+    return t
+
+
+def progress(title, name=""):
+    c = ProgressCard(title, name=name)
+    c.show_in_stack()
+    return c
+
+
+def main(desktop=None):
+    """Launched standalone (e.g. from launchpad) → show a demo toast
+    so the user can verify the notification system works."""
+    toast("Notifications", "Animated glass cards are working.",
+           kind="ok", duration=4000)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    main(None)
+    # Keep alive 5s for the demo
+    QTimer.singleShot(5000, app.quit)
+    sys.exit(app.exec_())

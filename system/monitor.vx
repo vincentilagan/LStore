@@ -1,0 +1,369 @@
+# VX:name=Monitor
+# VX:icon=📊
+# VX:version=3.0
+# VX:author=Vincent Ilagan
+# VX:sig=oIKltl3z8LcyUkxL7XzWEz4vwrvA/feOj7umBZsRM8iBK0uAk6RuPwEraS+FIipmL+WYViQP9BvowhkpJForBw==
+"""
+monitor.vx — Resource Monitor for Luci OS (v3).
+
+A Windows-Resource-Monitor-class view: tabbed Overview / CPU / Memory /
+Disk / Network / GPU, each with a live rolling graph and a sortable
+process table (PID, name, CPU%, memory, threads). The GPU tab reads the
+NVIDIA GTX 1060 via nvidia-smi (utilisation, VRAM, temperature) so you can
+see what is eating the card. Data comes from psutil + nvidia-smi — 100%
+original Luci UI.
+"""
+import os, sys, subprocess, collections
+
+from PyQt5.QtCore    import Qt, QTimer, QPointF
+from PyQt5.QtGui     import (QFont, QPainter, QColor, QPen, QBrush,
+                             QLinearGradient, QPolygonF)
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                             QTabWidget, QTableWidget, QTableWidgetItem,
+                             QHeaderView, QFrame, QGridLayout)
+
+from luci import _QtLucyWindow, _UI_FAM
+
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+
+def _fmt(n):
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or u == "TB":
+            return ("%.0f %s" % (n, u)) if u == "B" else ("%.1f %s" % (n, u))
+        n /= 1024
+
+
+def _gpu_stats():
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3).stdout.strip()
+        if not out:
+            return None
+        name, util, used, total, temp = [x.strip() for x in out.split(",")]
+        return {"name": name, "util": float(util), "used": float(used),
+                "total": float(total), "temp": float(temp)}
+    except Exception:
+        return None
+
+
+def _gpu_procs():
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3).stdout.strip()
+        rows = []
+        for ln in out.splitlines():
+            parts = [x.strip() for x in ln.split(",")]
+            if len(parts) >= 3:
+                rows.append((parts[0], parts[1], parts[2]))
+        return rows
+    except Exception:
+        return []
+
+
+# ── rolling sparkline ─────────────────────────────────────────────────
+class _Spark(QWidget):
+    def __init__(self, color="#4c8dff", maxv=100.0, n=60):
+        super().__init__()
+        self._buf = collections.deque([0.0] * n, maxlen=n)
+        self._color = color
+        self._max = maxv
+        self.setMinimumHeight(60)
+
+    def push(self, v):
+        try: self._buf.append(float(v))
+        except Exception: self._buf.append(0.0)
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        p.fillRect(self.rect(), QColor(10, 16, 30))
+        p.setPen(QPen(QColor(255, 255, 255, 20)))
+        for i in range(1, 4):
+            y = int(h * i / 4); p.drawLine(0, y, w, y)
+        buf = list(self._buf)
+        mx = max(self._max, max(buf) if buf else 1) or 1
+        n = len(buf)
+        pts = [QPointF(w * i / (n - 1), h - (buf[i] / mx) * h * 0.94 - 2)
+               for i in range(n)]
+        grad = QLinearGradient(0, 0, 0, h)
+        c1 = QColor(self._color); c1.setAlpha(120); grad.setColorAt(0, c1)
+        c2 = QColor(self._color); c2.setAlpha(12);  grad.setColorAt(1, c2)
+        p.setPen(Qt.NoPen); p.setBrush(QBrush(grad))
+        p.drawPolygon(QPolygonF([QPointF(0, h)] + pts + [QPointF(w, h)]))
+        pen = QPen(QColor(self._color)); pen.setWidth(2)
+        p.setPen(pen); p.setBrush(Qt.NoBrush)
+        for i in range(1, n):
+            p.drawLine(pts[i - 1], pts[i])
+
+
+def _card(title):
+    f = QFrame()
+    f.setStyleSheet("QFrame{background:rgba(30,38,60,120);border:1px solid "
+                    "rgba(120,160,220,50);border-radius:12px;}")
+    lay = QVBoxLayout(f); lay.setContentsMargins(12, 10, 12, 12); lay.setSpacing(6)
+    t = QLabel(title); t.setFont(QFont(_UI_FAM, 9, QFont.Bold))
+    t.setStyleSheet("color:#9fb2d8;background:transparent;border:none;")
+    lay.addWidget(t)
+    return f, lay
+
+
+def _proc_table():
+    t = QTableWidget(0, 5)
+    t.setHorizontalHeaderLabels(["PID", "Name", "CPU %", "Memory", "Threads"])
+    t.verticalHeader().setVisible(False)
+    t.setEditTriggers(QTableWidget.NoEditTriggers)
+    t.setSelectionBehavior(QTableWidget.SelectRows)
+    t.setStyleSheet(
+        "QTableWidget{background:rgba(12,18,34,140);color:#dce8f8;gridline-color:"
+        "rgba(255,255,255,18);border:1px solid rgba(120,160,220,50);border-radius:10px;}"
+        "QHeaderView::section{background:rgba(30,40,64,220);color:#9fb2d8;"
+        "border:none;padding:6px;font-weight:600;}")
+    h = t.horizontalHeader()
+    h.setSectionResizeMode(1, QHeaderView.Stretch)
+    for c in (0, 2, 3, 4):
+        h.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+    return t
+
+
+class Monitor(_QtLucyWindow):
+    def __init__(self, desktop):
+        super().__init__(desktop, "Resource Monitor", 1000, 680, "📊")
+        self._desktop = desktop
+        self._last_disk = None
+        self._last_net = None
+        self._pcache = {}
+        self._sparks = {}                 # metric key -> [spark, ...]
+        self._vals = {}                   # metric key -> [label, ...]
+        self._build()
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(1000)
+        self._tick()
+
+    # helpers that register widgets so _update can fan out to all of them
+    def _spark(self, key, color, maxv=100.0):
+        s = _Spark(color, maxv)
+        self._sparks.setdefault(key, []).append(s)
+        return s
+
+    def _val(self, key, big=True):
+        l = QLabel("—")
+        l.setFont(QFont(_UI_FAM, 15 if big else 10, QFont.Bold if big else QFont.Normal))
+        l.setStyleSheet("color:#eaf2ff;background:transparent;border:none;")
+        self._vals.setdefault(key, []).append(l)
+        return l
+
+    def _push(self, key, v):
+        for s in self._sparks.get(key, []):
+            s.push(v)
+
+    def _set(self, key, text):
+        for l in self._vals.get(key, []):
+            l.setText(text)
+
+    # ── layout ─────────────────────────────────────────────────────────
+    def _build(self):
+        root = QVBoxLayout(self.content)
+        root.setContentsMargins(12, 10, 12, 12); root.setSpacing(10)
+        if psutil is None:
+            root.addWidget(QLabel("psutil not available — cannot read metrics."))
+            return
+
+        self._tabs = QTabWidget()
+        self._tabs.setStyleSheet(
+            "QTabWidget::pane{border:1px solid rgba(120,160,220,50);border-radius:10px;}"
+            "QTabBar::tab{background:rgba(30,40,64,150);color:#9fb2d8;padding:7px 16px;"
+            "border-top-left-radius:8px;border-top-right-radius:8px;margin-right:2px;}"
+            "QTabBar::tab:selected{background:rgba(76,141,255,150);color:white;}")
+        root.addWidget(self._tabs, 1)
+
+        # ── Overview ──────────────────────────────────────────────────
+        ov = QWidget(); ovl = QVBoxLayout(ov); ovl.setSpacing(10)
+        grid = QGridLayout(); grid.setSpacing(10); ovl.addLayout(grid)
+        self._mini(grid, 0, 0, "CPU", "cpu", "#4c8dff")
+        self._mini(grid, 0, 1, "Memory", "mem", "#a06bff")
+        self._mini(grid, 0, 2, "GPU", "gpu", "#76d572")
+        self._mini(grid, 1, 0, "Disk", "disk", "#38d39f", 20 * 1024 * 1024)
+        self._mini(grid, 1, 1, "Network", "net", "#febc2e", 1024 * 1024)
+        pf, pl = _card("Processes"); pl.addWidget(self._val("procs")); grid.addWidget(pf, 1, 2)
+        self.tbl_over = _proc_table(); ovl.addWidget(self.tbl_over, 1)
+        self._tabs.addTab(ov, "Overview")
+
+        # ── CPU ───────────────────────────────────────────────────────
+        cpu = QWidget(); cl = QVBoxLayout(cpu); cl.setSpacing(8)
+        c1, c1l = _card("CPU usage  ·  live"); c1l.addWidget(self._spark("cpu", "#4c8dff"))
+        cl.addWidget(c1)
+        cores_host = QGridLayout(); cw = QWidget(); cw.setLayout(cores_host); cl.addWidget(cw)
+        self._core_bars = []
+        for i in range(psutil.cpu_count() or 1):
+            b = _Spark("#4c8dff"); b.setMinimumHeight(38)
+            lbl = QLabel("Core %d" % i); lbl.setFont(QFont(_UI_FAM, 7))
+            lbl.setStyleSheet("color:#9fb2d8;background:transparent;")
+            cell = QVBoxLayout(); cell.setSpacing(1); cell.addWidget(lbl); cell.addWidget(b)
+            hold = QWidget(); hold.setLayout(cell)
+            cores_host.addWidget(hold, i // 6, i % 6)
+            self._core_bars.append(b)
+        self.tbl_cpu = _proc_table(); cl.addWidget(self.tbl_cpu, 1)
+        self._tabs.addTab(cpu, "CPU")
+
+        # ── Memory ────────────────────────────────────────────────────
+        mem = QWidget(); ml = QVBoxLayout(mem); ml.setSpacing(8)
+        m1, m1l = _card("Memory usage  ·  live"); m1l.addWidget(self._spark("mem", "#a06bff"))
+        ml.addWidget(m1)
+        self.mem_detail = self._detail(); ml.addWidget(self.mem_detail)
+        self.tbl_mem = _proc_table(); ml.addWidget(self.tbl_mem, 1)
+        self._tabs.addTab(mem, "Memory")
+
+        # ── Disk ──────────────────────────────────────────────────────
+        dsk = QWidget(); dl = QVBoxLayout(dsk); dl.setSpacing(8)
+        d1, d1l = _card("Disk I/O  ·  live"); d1l.addWidget(self._spark("disk", "#38d39f", 20 * 1024 * 1024))
+        dl.addWidget(d1)
+        self.disk_detail = self._detail(); dl.addWidget(self.disk_detail); dl.addStretch(1)
+        self._tabs.addTab(dsk, "Disk")
+
+        # ── Network ───────────────────────────────────────────────────
+        net = QWidget(); nl = QVBoxLayout(net); nl.setSpacing(8)
+        n1, n1l = _card("Network I/O  ·  live"); n1l.addWidget(self._spark("net", "#febc2e", 1024 * 1024))
+        nl.addWidget(n1)
+        self.net_detail = self._detail(); nl.addWidget(self.net_detail); nl.addStretch(1)
+        self._tabs.addTab(net, "Network")
+
+        # ── GPU ───────────────────────────────────────────────────────
+        gpu = QWidget(); gl = QVBoxLayout(gpu); gl.setSpacing(8)
+        self.gpu_name = QLabel("GPU"); self.gpu_name.setFont(QFont(_UI_FAM, 12, QFont.Bold))
+        self.gpu_name.setStyleSheet("color:#eaf2ff;background:transparent;")
+        gl.addWidget(self.gpu_name)
+        g1, g1l = _card("GPU utilisation  ·  live"); g1l.addWidget(self._spark("gpu", "#76d572"))
+        gl.addWidget(g1)
+        self.gpu_detail = self._detail(); gl.addWidget(self.gpu_detail)
+        self.tbl_gpu = QTableWidget(0, 3)
+        self.tbl_gpu.setHorizontalHeaderLabels(["PID", "Process", "GPU Memory"])
+        self.tbl_gpu.verticalHeader().setVisible(False)
+        self.tbl_gpu.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.tbl_gpu.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.tbl_gpu.setStyleSheet(self.tbl_over.styleSheet())
+        gl.addWidget(self.tbl_gpu, 1)
+        self._tabs.addTab(gpu, "GPU")
+
+    def _mini(self, grid, r, c, title, key, color, maxv=100.0):
+        f, lay = _card(title)
+        lay.addWidget(self._val(key))
+        lay.addWidget(self._spark(key, color, maxv))
+        grid.addWidget(f, r, c)
+
+    def _detail(self):
+        l = QLabel("—"); l.setStyleSheet("color:#cfe0ff;background:transparent;")
+        return l
+
+    # ── per-tick update ─────────────────────────────────────────────────
+    def _tick(self):
+        if psutil is None:
+            return
+        try:
+            self._update()
+        except Exception as ex:
+            try: self.gpu_detail.setText("error: %s" % ex)
+            except Exception: pass
+
+    def _update(self):
+        cpu = psutil.cpu_percent(interval=0)
+        self._push("cpu", cpu); self._set("cpu", "%.0f %%" % cpu)
+        for b, v in zip(getattr(self, "_core_bars", []),
+                        psutil.cpu_percent(interval=0, percpu=True)):
+            b.push(v)
+
+        vm = psutil.virtual_memory()
+        self._push("mem", vm.percent); self._set("mem", "%.0f %%" % vm.percent)
+        self.mem_detail.setText(
+            "Used %s of %s   ·   available %s   ·   %.0f%%" % (
+                _fmt(vm.used), _fmt(vm.total), _fmt(vm.available), vm.percent))
+
+        d = psutil.disk_io_counters()
+        if self._last_disk:
+            rd = d.read_bytes - self._last_disk.read_bytes
+            wr = d.write_bytes - self._last_disk.write_bytes
+            self._push("disk", rd + wr); self._set("disk", "%s/s" % _fmt(rd + wr))
+            self.disk_detail.setText("Read %s/s   ·   Write %s/s" % (_fmt(rd), _fmt(wr)))
+        self._last_disk = d
+
+        n = psutil.net_io_counters()
+        if self._last_net:
+            up = n.bytes_sent - self._last_net.bytes_sent
+            dn = n.bytes_recv - self._last_net.bytes_recv
+            self._push("net", up + dn); self._set("net", "%s/s" % _fmt(up + dn))
+            self.net_detail.setText("Up %s/s   ·   Down %s/s" % (_fmt(up), _fmt(dn)))
+        self._last_net = n
+
+        g = _gpu_stats()
+        if g:
+            self._push("gpu", g["util"]); self._set("gpu", "%.0f %%" % g["util"])
+            self.gpu_name.setText(g["name"])
+            self.gpu_detail.setText(
+                "Utilisation %.0f%%   ·   VRAM %.0f / %.0f MB   ·   %.0f°C" % (
+                    g["util"], g["used"], g["total"], g["temp"]))
+            gp = _gpu_procs()
+            self.tbl_gpu.setRowCount(len(gp))
+            for i, (pid, nm, mem) in enumerate(gp):
+                self.tbl_gpu.setItem(i, 0, QTableWidgetItem(pid))
+                self.tbl_gpu.setItem(i, 1, QTableWidgetItem(nm))
+                self.tbl_gpu.setItem(i, 2, QTableWidgetItem(mem + " MB"))
+        else:
+            self._set("gpu", "n/a")
+            self.gpu_detail.setText("No NVIDIA GPU stats (nvidia-smi unavailable).")
+
+        rows, alive = [], set()
+        for p in psutil.process_iter(["pid", "name", "memory_info", "num_threads"]):
+            pid = p.info["pid"]; alive.add(pid)
+            pr = self._pcache.get(pid)
+            if pr is None:
+                try:
+                    pr = psutil.Process(pid); pr.cpu_percent(None)
+                    self._pcache[pid] = pr
+                except Exception:
+                    continue
+            try: cpu_p = pr.cpu_percent(None)
+            except Exception: cpu_p = 0.0
+            mi = p.info.get("memory_info")
+            rows.append((cpu_p, pid, p.info.get("name") or "?",
+                         mi.rss if mi else 0, p.info.get("num_threads") or 0))
+        for pid in list(self._pcache):
+            if pid not in alive:
+                self._pcache.pop(pid, None)
+
+        by_cpu = sorted(rows, key=lambda r: r[0], reverse=True)[:15]
+        by_mem = sorted(rows, key=lambda r: r[3], reverse=True)[:15]
+        self._fill(self.tbl_over, by_cpu)
+        self._fill(getattr(self, "tbl_cpu", None), by_cpu)
+        self._fill(getattr(self, "tbl_mem", None), by_mem)
+        self._set("procs", "%d" % len(rows))
+
+    def _fill(self, tbl, rows):
+        if tbl is None:
+            return
+        tbl.setRowCount(len(rows))
+        for i, (cpu_p, pid, name, rss, thr) in enumerate(rows):
+            tbl.setItem(i, 0, QTableWidgetItem(str(pid)))
+            tbl.setItem(i, 1, QTableWidgetItem(name))
+            tbl.setItem(i, 2, QTableWidgetItem("%.1f" % cpu_p))
+            tbl.setItem(i, 3, QTableWidgetItem(_fmt(rss)))
+            tbl.setItem(i, 4, QTableWidgetItem(str(thr)))
+
+    def closeEvent(self, e):
+        try: self._timer.stop()
+        except Exception: pass
+        super().closeEvent(e)
+
+
+def main(desktop):
+    Monitor(desktop)

@@ -1,0 +1,754 @@
+# VX:name=Apps
+# VX:icon=🚀
+# VX:version=2.0
+# VX:author=Vincent Ilagan
+# VX:sig=ZyMd74hc1zwkK1fKBKvHJxflmOajCN4KeeKTsvuQ+Gah3d2kUKJyaGA4qxQbb2SQPKFYJnjvxLcErYRxPZ87BA==
+"""
+Luci App Launcher — fullscreen blurred overlay.
+
+Design
+======
+  • Grabs the current desktop pixmap on open, applies a real Gaussian
+    blur (Qt's QGraphicsBlurEffect rendered into a QImage), and paints
+    that as the background — the desktop visibly fades to glass behind
+    the launcher.
+  • A subtle dark tint sits on top for legibility without losing the
+    desktop's color cast.
+  • Icons render as bare emoji + name labels with a soft hover halo
+    instead of the chunky 88×88 boxes from v1.
+  • Glassy rounded search bar centred at the top with live filtering
+    on every keystroke.
+  • Click outside any tile or press Esc to dismiss.
+
+Why Qt now (was Tk in v1)?
+  Tk on FreeBSD has no compositor hook and `attributes("-alpha", ...)`
+  blends the whole toplevel uniformly, which can't produce a real
+  blur. PyQt5 lets us screen-grab + blur + composite ourselves and
+  reuses the rest of Luci's glass aesthetic.
+"""
+
+import os, sys
+from PyQt5.QtCore    import (Qt, QTimer, QRectF, QPointF, QSize,
+                              QEvent, pyqtSignal)
+from PyQt5.QtGui     import (QFont, QColor, QPainter, QPen, QBrush,
+                              QPainterPath, QLinearGradient, QPixmap,
+                              QImage, QFontMetrics, QGuiApplication, QMovie)
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                              QLineEdit, QPushButton, QScrollArea,
+                              QFrame, QGridLayout, QGraphicsBlurEffect,
+                              QGraphicsScene, QGraphicsPixmapItem,
+                              QApplication, QMenu, QMessageBox)
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+try:
+    from luci import C, PROG_DIR, lucy_log, _UI_FAM, get_theme_icons_dir
+except Exception:
+    C = {"accent":"#5ec8ff","text":"#e6f1ff","dim":"#7d99c4",
+         "panel":"#121827","bg":"#0a0e17"}
+    PROG_DIR = os.path.dirname(os.path.abspath(__file__))
+    _UI_FAM = "Segoe UI"
+    def lucy_log(*a, **k): pass
+    def get_theme_icons_dir(): return ""
+
+try:
+    from PyQt5.QtSvg import QSvgRenderer
+    _SVG_OK = True
+except Exception:
+    _SVG_OK = False
+
+
+def _saturate(qc, sat=1.45, val=1.1):
+    try:
+        h, s, v, a = qc.getHsv()
+        if h < 0: return QColor(qc)
+        out = QColor(); out.setHsv(h, min(255,int(s*sat)),
+                                   min(255,int(v*val)), a)
+        return out
+    except Exception:
+        return QColor(qc)
+
+
+# Apps we never want surfaced — internal runtime + the launcher itself.
+_HIDE = {"launchpad", "nbcore", "heart",
+         "blackhole-client"}  # client is for the OTHER computer
+
+# ── Main apps (shown as direct icons in the launcher) ────────────────
+# Everything else gets collected into the "Utilities" folder tile,
+# macOS-Launchpad-style. The user can still get to any utility by
+# opening the folder.
+_MAIN = {"blackhole", "chrome", "nodebase", "notes", "pixel",
+          "ai_theme", "video", "terminal", "capture"}
+
+
+# ── App scanner ───────────────────────────────────────────────────────
+# User-installed apps (e.g. from LStore) land here — no root needed. We
+# scan it alongside the built-in programfiles so an installed app appears
+# in the Launchpad with its own icon straight after install.
+_USER_APPS = os.path.join(os.path.expanduser("~"), ".config", "luci", "apps")
+
+# Per-app PNG icon overrides. Drop <appkey>.png here (e.g. monitor.png) and
+# it wins over the theme SVG and the emoji — this is how any app, built-in
+# or installed, gets a real icon without editing the app itself.
+_APPICONS = os.path.join(os.path.expanduser("~"), ".config", "luci", "appicons")
+
+# Appearance prefs (written by the Appearance app). Animated icons are OFF
+# by default; when ON, a <key>.webp or <key>.gif in appicons animates.
+_APPEARANCE = os.path.join(os.path.expanduser("~"), ".config", "luci",
+                           "appearance.json")
+
+
+def _animated_on():
+    try:
+        import json as _j
+        with open(_APPEARANCE, encoding="utf-8") as f:
+            return bool(_j.load(f).get("animated_icons", False))
+    except Exception:
+        return False
+
+# macOS apps installed by Tuba live here as <Name>.app bundles, with their
+# real icon extracted to Applications/.icons/<Name>.png. They show in the
+# Launchpad so an installed .dmg app is never "missing" — but they can't run
+# (Cocoa), so clicking one shows an honest notice.
+_MAC_APPS = os.path.join(os.path.expanduser("~"), "Applications")
+
+
+def _scan_native_apps():
+    out = []
+    try:
+        names = sorted(os.listdir(_MAC_APPS))
+    except Exception:
+        return out
+    icons = os.path.join(_MAC_APPS, ".icons")
+    for n in names:
+        if not n.endswith(".app"):
+            continue
+        base = n[:-4]
+        ip = os.path.join(icons, base + ".png")
+        out.append(({"name": base, "icon": "🍎",
+                     "iconpath": ip if os.path.isfile(ip) else "",
+                     "native": True},
+                    os.path.join(_MAC_APPS, n)))
+    return out
+
+
+def _scan_apps():
+    apps = []
+    seen = set()
+    for base in (PROG_DIR, _USER_APPS):
+        try:
+            names = sorted(os.listdir(base))
+        except Exception:
+            continue
+        for fname in names:
+            if not fname.endswith(".vx"):
+                continue
+            key = fname[:-3].lower()
+            if key in _HIDE or key in seen:
+                continue
+            seen.add(key)
+            path = os.path.join(base, fname)
+            meta = {"name": fname[:-3], "icon": "📦"}
+            try:
+                with open(path, encoding="utf-8") as f:
+                    for _ in range(8):
+                        line = f.readline()
+                        if not line: break
+                        line = line.strip()
+                        if not line.startswith("# VX:"):
+                            break
+                        kv = line[5:].split("=", 1)
+                        if len(kv) == 2:
+                            meta[kv[0].strip()] = kv[1].strip()
+            except Exception:
+                pass
+            apps.append((meta, path))
+    return apps
+
+
+# ── Background blur: render screen pixmap through QGraphicsBlurEffect
+def _blurred_screen(radius=22):
+    """Capture the current screen, apply a Gaussian blur of `radius`
+    pixels, return a QPixmap the same size as the screen. Pure Qt,
+    no external dependencies."""
+    scr = QGuiApplication.primaryScreen()
+    if scr is None:
+        return QPixmap(1, 1)
+    src = scr.grabWindow(0)
+    if src.isNull():
+        return QPixmap(scr.geometry().size())
+    # Run the pixmap through a QGraphicsScene with a blur effect, then
+    # render the scene back to a flat QImage we can paint directly.
+    scene = QGraphicsScene()
+    item  = QGraphicsPixmapItem(src)
+    blur  = QGraphicsBlurEffect()
+    blur.setBlurRadius(radius)
+    item.setGraphicsEffect(blur)
+    scene.addItem(item)
+    img = QImage(src.size(), QImage.Format_ARGB32_Premultiplied)
+    img.fill(0)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.SmoothPixmapTransform)
+    scene.render(p)
+    p.end()
+    return QPixmap.fromImage(img)
+
+
+# ── Single tile widget (emoji + name + hover halo) ────────────────────
+class _Tile(QWidget):
+    clicked = pyqtSignal(str)
+
+    def __init__(self, meta, path, parent=None):
+        super().__init__(parent)
+        self._icon = meta.get("icon", "📦")
+        self._name = meta.get("name", "App")
+        self._path = path
+        self._hover = False
+        # mini_icons: when set, render a 2×2 preview of contained apps
+        # instead of a single emoji. Used for the Utilities folder.
+        self._mini_icons = None
+        # Highest-priority icon: an explicit iconpath (e.g. a native app's
+        # extracted .icns), else a user-supplied PNG in _APPICONS.
+        self._png = None
+        _ip = meta.get("iconpath")
+        if _ip and os.path.isfile(_ip):
+            try:
+                _pm = QPixmap(_ip)
+                if not _pm.isNull():
+                    self._png = _pm
+            except Exception:
+                self._png = None
+        if self._png is None and path and path.endswith(".vx"):
+            try:
+                _k = os.path.basename(path)[:-3].lower()
+                _pp = os.path.join(_APPICONS, _k + ".png")
+                if os.path.isfile(_pp):
+                    _pm = QPixmap(_pp)
+                    if not _pm.isNull():
+                        self._png = _pm
+            except Exception:
+                self._png = None
+        # No user icon → the app's REAL system icon via the SHARED resolver
+        # (same one the dock uses), so an app looks IDENTICAL in both places.
+        if self._png is None and path:
+            try:
+                from luci import find_app_icon_file as _fai
+                _k2 = os.path.splitext(os.path.basename(path))[0].lower()
+                _rp = _fai([_k2, meta.get("name", "")])
+                if _rp:
+                    _pm = QPixmap(_rp)
+                    if not _pm.isNull():
+                        self._png = _pm
+            except Exception:
+                pass
+        # Animated icon (highest priority when Appearance → Animated Icons is
+        # ON): a <key>.webp or <key>.gif in appicons plays as a QMovie.
+        self._movie = None
+        if path and _animated_on():
+            try:
+                _k = os.path.splitext(os.path.basename(path))[0].lower()
+                for _ext in (".webp", ".gif"):
+                    _mp = os.path.join(_APPICONS, _k + _ext)
+                    if os.path.isfile(_mp):
+                        mv = QMovie(_mp)
+                        if mv.isValid():
+                            mv.frameChanged.connect(lambda _n: self.update())
+                            mv.start()
+                            self._movie = mv
+                        break
+            except Exception:
+                self._movie = None
+        # Material-Symbol SVG (theme-tinted) instead of the bare emoji.
+        self._svg = None
+        self._pm_cache = {}
+        if _SVG_OK and path:
+            try:
+                key = os.path.basename(path)[:-3].lower()
+                idir = get_theme_icons_dir()
+                svgp = os.path.join(idir, f"{key}.svg") if idir else ""
+                # Only use a theme SVG if THIS app has its own. We no longer
+                # fall back to a shared _default.svg — that made every app
+                # without a custom glyph look identical. With no per-app SVG
+                # we leave _svg = None so paintEvent draws the app's own
+                # emoji (VX:icon), which is distinct per app.
+                if svgp and os.path.isfile(svgp):
+                    self._svg = QSvgRenderer(svgp)
+            except Exception:
+                self._svg = None
+        # Smooth hover animation: _t eases 0→1 on enter, 1→0 on leave.
+        # Drives both the icon grow and the halo fade (like the dock).
+        self._t = 0.0
+        self._t_target = 0.0
+        self._anim_timer = None
+        self.setFixedSize(120, 130)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setAttribute(Qt.WA_StyledBackground, False)
+
+    def _icon_pm(self, size):
+        """Theme-tinted Material glyph: white normally, saturated accent
+        gradient on hover. Cached by (size, hover, accent)."""
+        if self._svg is None:
+            return None
+        acc = C.get("accent", "#5ec8ff"); acc2 = C.get("accent2", acc)
+        key = (int(size), bool(self._hover), acc, acc2)
+        pm = self._pm_cache.get(key)
+        if pm is None:
+            n = int(size)
+            pm = QPixmap(n, n); pm.fill(Qt.transparent)
+            pp = QPainter(pm); pp.setRenderHint(QPainter.Antialiasing)
+            self._svg.render(pp, QRectF(0, 0, n, n))
+            pp.setCompositionMode(QPainter.CompositionMode_SourceIn)
+            if self._hover:
+                g = QLinearGradient(0, 0, 0, n)
+                g.setColorAt(0.0, _saturate(QColor(acc)))
+                g.setColorAt(1.0, _saturate(QColor(acc2)))
+                pp.fillRect(pm.rect(), QBrush(g))
+            else:
+                pp.fillRect(pm.rect(), QColor("#ffffff"))
+            pp.end()
+            if len(self._pm_cache) > 6: self._pm_cache.clear()
+            self._pm_cache[key] = pm
+        return pm
+
+    def enterEvent(self, _e):
+        self._hover = True;  self._t_target = 1.0; self._start_anim()
+    def leaveEvent(self, _e):
+        self._hover = False; self._t_target = 0.0; self._start_anim()
+
+    def _start_anim(self):
+        if self._anim_timer is None:
+            self._anim_timer = QTimer(self)
+            self._anim_timer.timeout.connect(self._anim_step)
+        if not self._anim_timer.isActive():
+            self._anim_timer.start(16)        # ~60fps
+
+    def _anim_step(self):
+        d = self._t_target - self._t
+        if abs(d) < 0.03:
+            self._t = self._t_target
+            self._anim_timer.stop()
+        else:
+            self._t += d * 0.28               # ease toward target
+        self.update()
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self._path)
+
+    def contextMenuEvent(self, e):
+        # Right-click → Uninstall, but only for user-installed apps (the
+        # tile is given an _uninstall_cb by the launcher for those). Built-in
+        # system apps have no callback, so they can't be removed from here.
+        cb = getattr(self, "_uninstall_cb", None)
+        if not cb:
+            return
+        m = QMenu(self)
+        m.setStyleSheet(
+            "QMenu{background:rgba(22,28,46,240);color:#e6f1ff;"
+            "border:1px solid rgba(255,255,255,40);border-radius:8px;padding:6px;}"
+            "QMenu::item{padding:6px 22px;border-radius:6px;}"
+            "QMenu::item:selected{background:rgba(94,200,255,60);}")
+        act = m.addAction("🗑  Uninstall " + self._name)
+        if m.exec_(e.globalPos()) is act:
+            cb(self._path, self._name)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # Hover halo — soft white-blue backing that fades in with _t.
+        if self._t > 0.01:
+            t = self._t
+            r = QRectF(w * 0.06, h * 0.04, w * 0.88, w * 0.88)
+            grad = QLinearGradient(r.topLeft(), r.bottomRight())
+            grad.setColorAt(0, QColor(255, 255, 255, int(64 * t)))
+            grad.setColorAt(1, QColor(94, 200, 255, int(46 * t)))
+            path = QPainterPath(); path.addRoundedRect(r, 20, 20)
+            p.fillPath(path, grad)
+            pen = QPen(QColor(255, 255, 255, int(95 * t))); pen.setWidth(1)
+            p.setPen(pen); p.setBrush(Qt.NoBrush); p.drawPath(path)
+
+        # Icon — either single emoji OR a 2×2 mini-grid for folder
+        # tiles (macOS Launchpad's stacked-folder look).
+        if self._mini_icons:
+            # Rounded panel behind the mini-grid (folder background)
+            panel = QRectF(w * 0.14, 10, w * 0.72, w * 0.66)
+            ppath = QPainterPath()
+            ppath.addRoundedRect(panel, 16, 16)
+            p.fillPath(ppath, QColor(255, 255, 255, 28))
+            pen = QPen(QColor(255, 255, 255, 70)); pen.setWidth(1)
+            p.setPen(pen); p.setBrush(Qt.NoBrush); p.drawPath(ppath)
+            # 2×2 mini emojis
+            p.setFont(QFont(_UI_FAM, 16))
+            p.setPen(QPen(QColor(255, 255, 255, 235)))
+            cells = [
+                (panel.x() + panel.width() * 0.25,
+                 panel.y() + panel.height() * 0.30),
+                (panel.x() + panel.width() * 0.75,
+                 panel.y() + panel.height() * 0.30),
+                (panel.x() + panel.width() * 0.25,
+                 panel.y() + panel.height() * 0.72),
+                (panel.x() + panel.width() * 0.75,
+                 panel.y() + panel.height() * 0.72),
+            ]
+            for (cx, cy), emoji in zip(cells, self._mini_icons[:4]):
+                p.drawText(QRectF(cx - 14, cy - 14, 28, 28),
+                            Qt.AlignCenter, emoji)
+        else:
+            base = int(w * 0.46)
+            grow = 1.0 + 0.16 * self._t          # smooth grow on hover
+            isz  = base * grow
+            cy   = 8 + (w * 0.7) / 2.0            # icon-area vertical centre
+            drew = False
+            if self._movie is not None:
+                # Animated icon (Appearance → Animated Icons ON).
+                fr = self._movie.currentPixmap()
+                if not fr.isNull():
+                    p.setRenderHint(QPainter.SmoothPixmapTransform)
+                    sp = fr.scaled(int(isz), int(isz), Qt.KeepAspectRatio,
+                                   Qt.SmoothTransformation)
+                    p.drawPixmap(int((w - sp.width()) / 2.0),
+                                 int(cy - sp.height() / 2.0), sp)
+                    drew = True
+            if not drew and self._png is not None and not self._png.isNull():
+                # User-supplied PNG icon — highest priority, drawn as-is.
+                p.setRenderHint(QPainter.SmoothPixmapTransform)
+                sp = self._png.scaled(int(isz), int(isz), Qt.KeepAspectRatio,
+                                      Qt.SmoothTransformation)
+                p.drawPixmap(int((w - sp.width()) / 2.0),
+                             int(cy - sp.height() / 2.0), sp)
+                drew = True
+            pm = None if drew else self._icon_pm(base)
+            if drew:
+                pass
+            elif pm is not None:
+                p.setRenderHint(QPainter.SmoothPixmapTransform)
+                ix = (w - isz) / 2.0
+                iy = cy - isz / 2.0
+                p.drawPixmap(QRectF(ix, iy, isz, isz), pm, QRectF(pm.rect()))
+            else:
+                p.setFont(QFont(_UI_FAM, int(38 * grow)))
+                p.setPen(QPen(QColor(255, 255, 255, 245)))
+                p.drawText(QRectF(0, 8, w, w * 0.7),
+                            Qt.AlignCenter, self._icon)
+
+        # Name
+        name = self._name
+        fm = QFontMetrics(QFont(_UI_FAM, 9))
+        if fm.horizontalAdvance(name) > w - 8:
+            while name and fm.horizontalAdvance(name + "…") > w - 8:
+                name = name[:-1]
+            name += "…"
+        p.setFont(QFont(_UI_FAM, 9))
+        p.setPen(QPen(QColor(245, 250, 255, 230)))
+        p.drawText(QRectF(0, w * 0.78, w, 22),
+                    Qt.AlignHCenter | Qt.AlignTop, name)
+
+
+# ── Main launcher window ──────────────────────────────────────────────
+class Launchpad(QWidget):
+    def __init__(self, desktop):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.Window)
+        self._desktop = desktop
+        self.setFocusPolicy(Qt.StrongFocus)
+        scr = QGuiApplication.primaryScreen().geometry()
+        self.setGeometry(scr)
+        self._bg_pix = _blurred_screen(radius=28)
+        self._apps = _scan_apps() + _scan_native_apps()
+
+        self._build()
+        self.installEventFilter(self)
+
+    # ── build UI ─────────────────────────────────────────────────────
+    def _build(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+
+        # Top region: title + search
+        top = QWidget(); top.setStyleSheet("background:transparent;")
+        tlay = QVBoxLayout(top); tlay.setContentsMargins(0, 64, 0, 0)
+        tlay.setSpacing(18); tlay.setAlignment(Qt.AlignHCenter)
+
+        # Search bar wrapper — glassy rounded rect
+        search_wrap = QWidget()
+        search_wrap.setFixedWidth(420)
+        search_wrap.setFixedHeight(46)
+        search_wrap.setObjectName("searchwrap")
+        search_wrap.setStyleSheet("""
+            QWidget#searchwrap {
+                background: rgba(255,255,255,28);
+                border: 1px solid rgba(255,255,255,80);
+                border-radius: 22px;
+            }
+        """)
+        sl = QHBoxLayout(search_wrap)
+        sl.setContentsMargins(20, 0, 20, 0)
+        ico = QLabel("🔍")
+        ico.setStyleSheet("background:transparent;color:#ffffff;")
+        ico.setFont(QFont(_UI_FAM, 13))
+        sl.addWidget(ico)
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search apps…")
+        self._search.setStyleSheet("""
+            QLineEdit {
+                background: transparent;
+                border: none;
+                color: #ffffff;
+                font: 13px "%s";
+                selection-background-color: rgba(94,200,255,140);
+            }
+        """ % _UI_FAM)
+        self._search.textChanged.connect(self._refilter)
+        sl.addWidget(self._search, stretch=1)
+        tlay.addWidget(search_wrap, alignment=Qt.AlignHCenter)
+        outer.addWidget(top)
+
+        # Grid host inside a scroll area (in case lots of apps)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setStyleSheet("""
+            QScrollArea{background:transparent;border:none;}
+            QScrollBar:vertical{background:transparent;width:6px;}
+            QScrollBar::handle:vertical{background:rgba(255,255,255,50);
+                border-radius:3px;min-height:20px;}
+            QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{
+                height:0;background:none;}""")
+        self._host = QWidget()
+        self._host.setStyleSheet("background:transparent;")
+        self._grid = QGridLayout(self._host)
+        self._grid.setContentsMargins(72, 32, 72, 44)
+        self._grid.setHorizontalSpacing(16)
+        self._grid.setVerticalSpacing(14)
+        self._scroll.setWidget(self._host)
+        outer.addWidget(self._scroll, stretch=1)
+
+        self._refilter()
+        QTimer.singleShot(80, self._search.setFocus)
+
+    # ── filter + grid layout ─────────────────────────────────────────
+    def _refilter(self):
+        ft = (self._search.text() or "").lower().strip()
+        # Clear current grid
+        while self._grid.count():
+            it = self._grid.takeAt(0)
+            if it.widget(): it.widget().deleteLater()
+
+        # Split into main vs utility lanes. Freshly INSTALLED apps (from
+        # LStore, living in _USER_APPS) always land on the main first page —
+        # like macOS, a new install shows up front, never buried in a folder.
+        uroot = os.path.normpath(_USER_APPS)
+        main_apps, util_apps = [], []
+        for meta, path in self._apps:
+            key = os.path.splitext(os.path.basename(path))[0].lower()
+            is_user = os.path.normpath(os.path.dirname(path)) == uroot
+            is_native = path.endswith(".app")     # Tuba-installed macOS app
+            if is_user or is_native or key in _MAIN:
+                main_apps.append((meta, path))
+            else:
+                util_apps.append((meta, path))
+
+        cols = 6
+
+        # ── In-folder view ───────────────────────────────────────────
+        if getattr(self, "_in_folder", False):
+            # When inside Utilities, search filters that set only.
+            shown = [(m, p) for m, p in util_apps
+                      if not ft or ft in m.get("name", "").lower()]
+            for i, (meta, path) in enumerate(shown):
+                tile = _Tile(meta, path)
+                tile.clicked.connect(self._launch)
+                r, c = divmod(i, cols)
+                self._grid.addWidget(tile, r, c, Qt.AlignHCenter | Qt.AlignTop)
+            if not shown:
+                empty = QLabel(f"No utilities match '{ft}'")
+                empty.setStyleSheet(
+                    f"color:{C.get('dim','#7d99c4')}; background:transparent;")
+                empty.setFont(QFont(_UI_FAM, 11))
+                empty.setAlignment(Qt.AlignCenter)
+                self._grid.addWidget(empty, 0, 0, 1, cols)
+            for c in range(cols): self._grid.setColumnStretch(c, 1)
+            return
+
+        # ── Top-level view: main apps as direct tiles + Utilities folder
+        # When a search is active we flatten everything (main + util)
+        # so the user can find anything by name.
+        if ft:
+            shown_main = [(m, p) for m, p in main_apps
+                           if ft in m.get("name", "").lower()]
+            shown_util = [(m, p) for m, p in util_apps
+                           if ft in m.get("name", "").lower()]
+            shown = shown_main + shown_util
+            for i, (meta, path) in enumerate(shown):
+                tile = _Tile(meta, path)
+                tile.clicked.connect(self._launch)
+                r, c = divmod(i, cols)
+                self._grid.addWidget(tile, r, c, Qt.AlignHCenter | Qt.AlignTop)
+            if not shown:
+                empty = QLabel(f"No apps match '{ft}'")
+                empty.setStyleSheet(
+                    f"color:{C.get('dim','#7d99c4')}; background:transparent;")
+                empty.setFont(QFont(_UI_FAM, 11))
+                empty.setAlignment(Qt.AlignCenter)
+                self._grid.addWidget(empty, 0, 0, 1, cols)
+            for c in range(cols): self._grid.setColumnStretch(c, 1)
+            return
+
+        # No search active — render the actual grouped view.
+        tiles = []
+        for meta, path in main_apps:
+            t = _Tile(meta, path)
+            t.clicked.connect(self._launch)
+            if os.path.normpath(os.path.dirname(path)) == uroot:
+                t._uninstall_cb = self._uninstall     # right-click → Uninstall
+            tiles.append(t)
+        # Utilities folder tile: synthesized path "__utilities__"
+        if util_apps:
+            folder_meta = {"icon": "📦", "name": "Utilities"}
+            folder = _Tile(folder_meta, "__utilities__")
+            # First 4 emoji from utility apps populate the 2×2 preview
+            folder._mini_icons = [m.get("icon", "📦") for m, _ in util_apps[:4]]
+            folder.clicked.connect(self._open_folder)
+            tiles.append(folder)
+
+        if not tiles:
+            empty = QLabel("No apps installed")
+            empty.setStyleSheet(
+                f"color:{C.get('dim','#7d99c4')}; background:transparent;")
+            empty.setFont(QFont(_UI_FAM, 11))
+            empty.setAlignment(Qt.AlignCenter)
+            self._grid.addWidget(empty, 0, 0, 1, cols)
+            return
+
+        for i, tile in enumerate(tiles):
+            r, c = divmod(i, cols)
+            self._grid.addWidget(tile, r, c, Qt.AlignHCenter | Qt.AlignTop)
+        for c in range(cols): self._grid.setColumnStretch(c, 1)
+
+    def _open_folder(self, _path):
+        """User clicked the Utilities folder tile → switch into its
+        view. Pressing Escape pops back out."""
+        self._in_folder = True
+        self._search.clear()  # clear search so all utility apps show
+        self._refilter()
+
+    # ── chrome (blurred screen + dark tint) ──────────────────────────
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        if not self._bg_pix.isNull():
+            p.drawPixmap(0, 0, self._bg_pix.scaled(
+                self.size(), Qt.IgnoreAspectRatio,
+                Qt.SmoothTransformation))
+        # Dark tint overlay for legibility — like macOS Launchpad
+        grad = QLinearGradient(0, 0, 0, self.height())
+        grad.setColorAt(0.0, QColor(6, 10, 26, 130))
+        grad.setColorAt(1.0, QColor(2, 6, 18, 150))
+        p.fillRect(self.rect(), grad)
+
+    # ── actions ─────────────────────────────────────────────────────
+    def _launch(self, path):
+        # A Tuba-installed macOS app can't run (Cocoa) — say so honestly
+        # instead of failing silently.
+        if path.endswith(".app"):
+            self._native_notice(path)
+            return
+        # Close FIRST so the launched app gets focus cleanly
+        self.close()
+        try:
+            self._desktop.launch_vx(path)
+        except Exception as ex:
+            lucy_log("ERROR", f"launchpad: {ex}")
+
+    def _native_notice(self, path):
+        base = os.path.basename(path)
+        if base.endswith(".app"):
+            base = base[:-4]
+        QMessageBox.information(
+            self, base,
+            base + " is a macOS app.\n\nLuci installed it, but it needs "
+            "Apple's frameworks (Cocoa / AppKit) that don't exist on FreeBSD, "
+            "so it can't run here.\n\nTip: install a native equivalent from "
+            "Software (e.g. GIMP, VLC, LibreOffice).")
+
+    def _uninstall(self, path, name):
+        # Remove a user-installed app (from LStore). Only files under
+        # _USER_APPS reach here, so we never touch built-in system apps.
+        r = QMessageBox.question(
+            self, "Uninstall",
+            "Remove %s from Luci?\nYou can reinstall it anytime from LStore." % name,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if r != QMessageBox.Yes:
+            return
+        try:
+            os.remove(path)
+        except Exception as ex:
+            lucy_log("ERROR", f"launchpad uninstall: {ex}")
+        self._apps = _scan_apps() + _scan_native_apps()
+        self._refilter()
+
+    def eventFilter(self, obj, e):
+        if obj is self and e.type() == QEvent.KeyPress:
+            if e.key() == Qt.Key_Escape:
+                if getattr(self, "_in_folder", False):
+                    self._in_folder = False; self._refilter()
+                else:
+                    self.close()
+                return True
+        return False
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            if getattr(self, "_in_folder", False):
+                self._in_folder = False; self._refilter()
+            else:
+                self.close()
+            return
+        super().keyPressEvent(e)
+
+    def mousePressEvent(self, e):
+        # Click anywhere that is NOT a tile or the search box closes the
+        # launcher. The old check (childAt is None) never fired because
+        # the scroll-area / grid widgets cover the background — so we
+        # walk up the widget chain and dismiss unless the click landed
+        # on something interactive.
+        node = self.childAt(e.pos())
+        while node is not None and node is not self:
+            if isinstance(node, (_Tile, QLineEdit)):
+                return                      # interactive — keep open
+            node = node.parent()
+        self.close()
+
+
+def main(desktop):
+    # Single-instance: lift if already open
+    existing = getattr(desktop, "_launchpad_panel", None)
+    try:
+        if existing is not None and existing.isVisible():
+            existing.raise_(); existing.activateWindow()
+            return existing
+    except Exception: pass
+    panel = Launchpad(desktop)
+    desktop._launchpad_panel = panel
+    panel.setWindowOpacity(0.0)
+    panel.show()
+    panel.raise_()
+    panel.activateWindow()
+    # Smooth fade-in (keep a ref so the animation isn't garbage-collected).
+    try:
+        from PyQt5.QtCore import QPropertyAnimation, QEasingCurve
+        anim = QPropertyAnimation(panel, b"windowOpacity")
+        anim.setDuration(200)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.start()
+        panel._fade_anim = anim
+    except Exception:
+        panel.setWindowOpacity(1.0)
+    return panel
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    app = QApplication(_sys.argv)
+    main(None)
+    _sys.exit(app.exec_())

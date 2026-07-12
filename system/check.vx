@@ -1,0 +1,168 @@
+﻿# VX:name=System Check
+# VX:icon=🔍
+# VX:version=1.0
+# VX:author=Lucy
+# VX:sig=wKtB988dL8c3psUtEPzrt1arpyG2pyjDDhH5hOb9Q7BlkkXQyyvGw7EGVccQMj+bmsYJYwXtdx5RADIr5+3CDw==
+
+import tkinter as tk
+import sys, os, importlib
+
+PACKAGES = [
+    ("tkinter",    "Built-in GUI",         True),
+    ("requests",   "Web / HTTP",           True),
+    ("PIL",        "Pillow — screenshots", True),
+    ("ddgs",       "DuckDuckGo search",    False),
+    ("sqlite3",    "Local database",       True),
+    ("json",       "JSON support",         True),
+    ("threading",  "Background threads",   True),
+    ("pyperclip",  "Clipboard",            False),
+]
+
+C = {
+    "bg":      "#080e1a",
+    "panel":   "#0d1525",
+    "border":  "#1e3050",
+    "accent":  "#3a7bd5",
+    "text":    "#d0e8ff",
+    "dim":     "#567090",
+    "green":   "#3ddc84",
+    "red":     "#ff5555",
+    "yellow":  "#ffcc44",
+    "bar":     "#0e1e38",
+    "win_bg":  "#0a1220",
+}
+
+
+def main(desktop):
+    win = tk.Toplevel(desktop.root)
+    win.overrideredirect(True)
+    win.configure(bg=C["border"])
+
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    w, h = 480, 420
+    win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+
+    # Title bar
+    # ── Title bar (global Luci chrome) ─────────────────────────────
+    if hasattr(desktop, "apply_chrome"):
+        desktop.apply_chrome(win, title="System Check",
+                              icon="🔍", include_body=False)
+    else:
+        bar = tk.Frame(win, bg=C["bar"], height=32)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        tk.Label(bar, text="  🔍  System Check",
+                 bg=C["bar"], fg=C["text"],
+                 font=("Segoe UI", 10, "bold")).pack(side="left", fill="y")
+        tk.Button(bar, text="✕", bg=C["bar"], fg=C["dim"],
+                  activebackground=C["red"], activeforeground="white",
+                  font=("Segoe UI", 10, "bold"), relief="flat", bd=0, padx=10,
+                  command=win.destroy).pack(side="right", fill="y")
+    
+        drag = [None]
+        def ds(e): drag[0] = (e.x_root - win.winfo_x(), e.y_root - win.winfo_y())
+        def dm(e):
+            if drag[0]: win.geometry(f"+{e.x_root-drag[0][0]}+{e.y_root-drag[0][1]}")
+        bar.bind("<ButtonPress-1>", ds)
+        bar.bind("<B1-Motion>", dm)
+
+    body = tk.Frame(win, bg=C["win_bg"])
+    body.pack(fill="both", expand=True, padx=1, pady=(0, 1))
+
+    # Python info
+    info = tk.Frame(body, bg=C["panel"])
+    info.pack(fill="x", padx=12, pady=10)
+    tk.Label(info, text=f"  Python {sys.version.split()[0]}",
+             bg=C["panel"], fg=C["text"],
+             font=("Consolas", 10, "bold")).pack(side="left", pady=6)
+    tk.Label(info, text=f"  {sys.executable}",
+             bg=C["panel"], fg=C["dim"],
+             font=("Segoe UI", 8), wraplength=320, anchor="w").pack(
+                 side="left", fill="x", expand=True, padx=8)
+
+    tk.Label(body, text="Package Status",
+             bg=C["win_bg"], fg=C["dim"],
+             font=("Segoe UI", 8, "bold"),
+             anchor="w").pack(fill="x", padx=14)
+
+    # Package rows
+    all_ok = True
+    missing_critical = []
+
+    for pkg, desc, critical in PACKAGES:
+        try:
+            importlib.import_module(pkg)
+            ok = True
+        except ImportError:
+            ok = False
+            if critical:
+                all_ok = False
+                missing_critical.append(pkg)
+
+        row = tk.Frame(body, bg=C["win_bg"])
+        row.pack(fill="x", padx=12, pady=2)
+
+        status_color = C["green"] if ok else (C["red"] if critical else C["yellow"])
+        status_text  = "✓  OK" if ok else ("✗  MISSING" if critical else "─  optional")
+
+        tk.Label(row, text=f"  {pkg:<14}",
+                 bg=C["win_bg"], fg=C["text"],
+                 font=("Consolas", 10)).pack(side="left")
+        tk.Label(row, text=desc,
+                 bg=C["win_bg"], fg=C["dim"],
+                 font=("Segoe UI", 9), width=22, anchor="w").pack(side="left")
+        tk.Label(row, text=status_text,
+                 bg=C["win_bg"], fg=status_color,
+                 font=("Consolas", 9, "bold")).pack(side="right", padx=8)
+
+    tk.Frame(body, bg=C["border"], height=1).pack(fill="x", padx=12, pady=8)
+
+    # Lucy paths
+    lucy_dir   = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    portable   = os.path.join(lucy_dir, "Vinx-Desktop", "dependencies", "python", "python.exe")
+    vinx_core  = os.path.join(lucy_dir, "floating_core.py")
+    vinx_mem   = os.path.join(lucy_dir, "memory")
+
+    path_checks = [
+        ("Lucy root",       lucy_dir,   os.path.isdir(lucy_dir)),
+        ("floating_core",   vinx_core,  os.path.isfile(vinx_core)),
+        ("memory/",         vinx_mem,   os.path.isdir(vinx_mem)),
+        ("Portable Python", portable,   os.path.isfile(portable)),
+    ]
+    for label, path, found in path_checks:
+        row = tk.Frame(body, bg=C["win_bg"])
+        row.pack(fill="x", padx=12, pady=1)
+        color = C["green"] if found else C["dim"]
+        icon  = "✓" if found else "─"
+        tk.Label(row, text=f"  {icon}  {label:<18}",
+                 bg=C["win_bg"], fg=color,
+                 font=("Consolas", 9)).pack(side="left")
+        tk.Label(row, text=os.path.basename(path),
+                 bg=C["win_bg"], fg=C["dim"],
+                 font=("Segoe UI", 8)).pack(side="left")
+
+    # Bottom status
+    bot = tk.Frame(body, bg=C["panel"])
+    bot.pack(fill="x", padx=12, pady=10)
+
+    if all_ok:
+        msg   = "  ✓  All critical packages OK — Lucy is ready"
+        color = C["green"]
+        btn_text = "Close"
+        btn_cmd  = win.destroy
+    else:
+        msg   = f"  ✗  Missing: {', '.join(missing_critical)}\n     Run setup.bat to install"
+        color = C["red"]
+        btn_text = "Open setup.bat"
+        def btn_cmd():
+            import subprocess
+            setup = os.path.join(lucy_dir, "setup.bat")
+            subprocess.Popen(["cmd", "/c", "start", "", setup], shell=True)
+
+    tk.Label(bot, text=msg, bg=C["panel"], fg=color,
+             font=("Segoe UI", 9), justify="left", anchor="w",
+             wraplength=380).pack(side="left", padx=4, pady=6, fill="x", expand=True)
+    tk.Button(bot, text=btn_text, bg=C["accent"], fg="white",
+              font=("Segoe UI", 9), relief="flat", bd=0, padx=12, pady=4,
+              command=btn_cmd).pack(side="right", padx=4, pady=4)

@@ -1,0 +1,211 @@
+# VX:name=Copying
+# VX:icon=📋
+# VX:version=2.0
+# VX:sig=vwH+fhDbszIPbLeGIbKjSuV6lGJ7yWnGty+THRnJW28+GVuKnBqEm7e1Fvdv2P9w2mkCdPEurkUW1UHn57EHCQ==
+"""
+Luci Copying — minimal glass progress window.
+
+Shape: a single white track line that fills left-to-right with blue as
+bytes are moved, plus a couple of glowing dots that flow along it to
+show that copying is actually happening (so the user never sees a frozen
+0%). No bordered bar, no rectangle — just the line on a transparent
+glass background.
+
+Polling runs at 10 FPS to keep it featherweight under picom xrender —
+the older 60 FPS version was driving the compositor too hard.
+
+Public API
+==========
+    show_progress(desktop, state)
+        Opens the line window and starts polling `state`. The CALLER
+        (the file-copy worker) mutates `state` in place:
+            total / done / bytes_total / bytes_done / current /
+            src_label / dest_label / started / complete / canceled
+"""
+import os, time, tkinter as tk
+from luci import C, FONT, FONT_BOLD, FONT_SM, LucyWindow
+
+
+def _fmt_size(b):
+    if b < 1024:       return f"{int(b)} B"
+    if b < 1024**2:    return f"{b/1024:.1f} KB"
+    if b < 1024**3:    return f"{b/1024**2:.1f} MB"
+    return f"{b/1024**3:.2f} GB"
+
+
+def _fmt_eta(s):
+    if s <= 0 or s != s:  return "…"
+    if s < 90:            return f"{int(s)}s"
+    if s < 3600:          return f"{int(s/60)}m"
+    return f"{s/3600:.1f}h"
+
+
+def show_progress(desktop, state):
+    """Open the floating line window backed by the shared `state` dict."""
+    win = LucyWindow(desktop, "Copying", 460, 96, "📋")
+    root = win.content
+    root.configure(bg=C.get("win_bg", "#0a1220"))
+
+    BG   = C.get("win_bg", "#0a1220")
+    ACC  = C.get("accent", "#4c8dff")
+    ACC2 = C.get("accent2", "#7aa9ff")
+    TXT  = C.get("text",  "#e6edf8")
+    DIM  = C.get("dim",   "#8893a8")
+
+    # ── Thin info row above the line — current name + pct + eta ──────────
+    info = tk.Label(root, text="Preparing…",
+                     bg=BG, fg=DIM, font=FONT_SM,
+                     anchor="w")
+    info.pack(fill="x", padx=22, pady=(14, 6))
+
+    # ── The line — just a Canvas, drawn with three primitives ────────────
+    H = 18
+    line = tk.Canvas(root, bg=BG, highlightthickness=0, height=H)
+    line.pack(fill="x", padx=22, pady=(0, 8))
+
+    phase   = [0.0]
+    pct_now = [0.0]      # smoothed for the fill animation
+    closed  = [False]
+
+    def _draw(pct):
+        line.delete("all")
+        w = line.winfo_width() or 416
+        cy = H // 2
+        LW = 3
+        fw = int(w * pct)
+        # ONE horizontal line — same thickness, same y. The left segment
+        # (already-copied portion) is blue, the right segment (still-to-
+        # do) is white. As the copy progresses the blue grows from the
+        # left and consumes the white from the right. Same line, not a
+        # separate fill block.
+        if fw > 0:
+            line.create_line(0, cy, fw, cy, fill=ACC,
+                             width=LW, capstyle="round")
+        if fw < w:
+            line.create_line(fw, cy, w, cy, fill="#e6edf8",
+                             width=LW, capstyle="round")
+        # Flowing accent dots on TOP of the line — a soft halo with a
+        # bright white core, spaced evenly across the bar, phase-shifted
+        # every tick so the line always reads as "actively copying".
+        n = 3
+        for i in range(n):
+            xf = ((i / n) + phase[0]) % 1.0
+            x  = xf * w
+            line.create_oval(x - 6, cy - 6, x + 6, cy + 6,
+                             fill=ACC2, outline="")
+            line.create_oval(x - 3, cy - 3, x + 3, cy + 3,
+                             fill="#ffffff", outline="")
+
+    # ── Cancel — single text label, no big button ────────────────────────
+    def _cancel():
+        try: state["canceled"] = True
+        except Exception: pass
+
+    btn = tk.Label(root, text="Cancel",
+                    bg=BG, fg=DIM, font=FONT_SM, cursor="hand2",
+                    padx=8)
+    btn.pack(side="right", padx=22, pady=(0, 8))
+    btn.bind("<Enter>", lambda _e: btn.config(fg=TXT))
+    btn.bind("<Leave>", lambda _e: btn.config(fg=DIM))
+    btn.bind("<Button-1>", lambda _e: _cancel())
+
+    def _close():
+        if closed[0]: return
+        closed[0] = True
+        try: win._close()
+        except Exception:
+            try: win._top.destroy()
+            except Exception: pass
+
+    # Hook window-close to also cancel (so the worker stops cleanly).
+    try:
+        win._top.protocol("WM_DELETE_WINDOW",
+                           lambda: (_cancel(), _close()))
+    except Exception: pass
+
+    # ── Tick — 10 FPS. That's enough for a moving dot, and keeps the
+    #     compositor (picom xrender on FreeBSD) breathing. The original
+    #     60 FPS version was a measurable CPU hog. ─────────────────────
+    def _tick():
+        if closed[0]: return
+        try:
+            total = max(1, int(state.get("total", 1)))
+            done  = int(state.get("done", 0))
+            bt    = max(1, int(state.get("bytes_total", 1)))
+            bd    = int(state.get("bytes_done", 0))
+            pct   = min(1.0, bd / bt) if bt > 1 else (done / total)
+            # Safety net: once the worker says it's finished, drive the
+            # target to 100% no matter what bytes_done reported. A CUT
+            # (move) never streams bytes, so without this the eased fill
+            # could never reach the 98.5% close threshold and the window
+            # would hang open. complete ALWAYS wins.
+            if state.get("complete"):
+                pct = 1.0
+            # Slow ease — even when bytes_done jumps from 0 to 100% in a
+            # single tick (instant copy of a small file on a working FS),
+            # the line still animates smoothly so the user actually sees
+            # the blue fill ride across the bar instead of an invisible
+            # single-frame flash. With 0.88 / 0.12 weights at 10 FPS, the
+            # fill takes roughly 1.5 s to ride from 0 → ~98 % which reads
+            # as deliberate motion rather than a snap.
+            pct_now[0] = pct_now[0] * 0.88 + pct * 0.12
+
+            elapsed = max(0.001,
+                          time.time() - state.get("started", time.time()))
+            if bd > 0:
+                speed  = bd / elapsed
+                remain = (bt - bd) / speed if speed > 0 else 0
+                rate   = f"{_fmt_size(speed)}/s · {_fmt_eta(remain)}"
+            else:
+                rate = "starting…"
+
+            cur = state.get("current", "")
+            info.config(text=f"{int(pct_now[0]*100)}%  ·  {cur}  ·  {rate}"[:80])
+
+            phase[0] = (phase[0] + 0.025) % 1.0
+            _draw(pct_now[0])
+
+            if state.get("canceled"):
+                win.after(300, _close); return
+            # On complete, keep ticking until the eased fill catches up
+            # (within 1%), THEN linger briefly so the user sees 100%
+            # before the window dismisses.
+            if state.get("complete") and pct_now[0] >= 0.985:
+                pct_now[0] = 1.0
+                _draw(1.0)
+                info.config(text=f"100%  ·  done  ·  {cur}"[:80])
+                win.after(500, _close)
+                return
+        except Exception:
+            pass
+        win.after(100, _tick)   # 10 FPS
+
+    line.bind("<Configure>", lambda _e: _draw(pct_now[0]))
+    win.after(50, _tick)
+
+
+def main(desktop):
+    """Smoke test."""
+    import threading
+    state = {
+        "total": 4, "done": 0,
+        "bytes_total": 40 * 1024 * 1024, "bytes_done": 0,
+        "current": "test.bin",
+        "src_label": "Demo", "dest_label": "Out",
+        "started": time.time(),
+        "complete": False, "canceled": False,
+    }
+    show_progress(desktop, state)
+    def fake():
+        for i in range(40):
+            time.sleep(0.15)
+            if state["canceled"]: return
+            state["bytes_done"] += 1024 * 1024
+            state["done"] = (i + 1) // 10
+            state["current"] = f"file_{i//10 + 1}.bin"
+        state["complete"] = True
+    threading.Thread(target=fake, daemon=True).start()
+
+
+if __name__ == "__main__":
+    main(None)

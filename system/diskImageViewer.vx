@@ -1,0 +1,463 @@
+# VX:name=Disk Image Viewer
+# VX:icon=🗄
+# VX:version=1.0
+# VX:author=Vincent Ilagan
+# VX:sig=BFheq7o3UjAQHF18aElIECvNnBpOEejkYRd+dd8ahlMmtWkLu9hdnlij4a5ww0tOiiBP046kbr/ilcb8SK6PCQ==
+#
+# ──────────────────────────────────────────────────────────────────────
+#  LEGAL NOTE — please read before editing.
+#
+#  This is a GENERIC, READ-ONLY disk-image inspector for Luci OS.
+#  It supports the open file-image formats:
+#       .dmg   .iso   .img   .vhd   .vhdx
+#
+#  All listing and extraction is done through open-source tools
+#  (p7zip — LGPL, dmg2img — GPL). No proprietary code from any
+#  vendor is bundled with Luci. No platform-specific application
+#  bundles are executed by this viewer — files inside an image may
+#  be browsed and extracted, but nothing is "run". The presence of
+#  .app folders (or any other bundle type) inside an image is shown
+#  as a regular folder of resources; clicking does not invoke any
+#  binary.
+#
+#  Window-control circles ("traffic lights") used by Luci are a UX
+#  convention that pre-dates Apple's macOS (Windows 3.x, NeXTSTEP,
+#  early Unix DEs). Luci's controls are HEXAGONAL, blue-where-the-
+#  pattern-would-be-green, and visually distinct from any vendor's
+#  design language.
+# ──────────────────────────────────────────────────────────────────────
+
+import tkinter as tk
+from tkinter import ttk, filedialog
+import threading
+import os
+import sys
+import subprocess
+import shutil
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))
+from luci import C, FONT, FONT_BOLD, FONT_SM, lucy_log
+
+# Supported open formats. .dmg is one of several — Luci has no special
+# affinity for it. ISO is by far the most common; DMG is treated as a
+# generic compressed disk image.
+SUPPORTED_EXTS = {".dmg", ".iso", ".img", ".vhd", ".vhdx"}
+
+
+# ── Cosmic-routed tool resolution ──────────────────────────────────────
+# If Luci's cosmic.hal exposes disk-image helpers (newer builds), use
+# them — that keeps the .vx 100% portable across hosts. Fall back to
+# direct 7z binary lookup so this viewer still works on older Luci
+# installs where the HAL hasn't been extended yet.
+def _resolve_cosmic_hal():
+    """Return the loaded host adapter module or None."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + "/cosmic")
+        from importlib.machinery import SourceFileLoader
+        from importlib.util import spec_from_loader, module_from_spec
+        cosmic_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "cosmic")
+        if not os.path.isdir(cosmic_dir):
+            return None
+        # Detect host adapter
+        import platform
+        host = platform.system().lower()
+        if "windows" in host:    name = "windows_host.vx"
+        elif "freebsd" in host:  name = "freebsd_host.vx"
+        elif "linux" in host:    name = "linux_host.vx"
+        else:                    return None
+        p = os.path.join(cosmic_dir, "adapters", name)
+        if not os.path.isfile(p):
+            return None
+        loader = SourceFileLoader("host_adapter", p)
+        spec = spec_from_loader(loader.name, loader)
+        mod = module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+_HAL = _resolve_cosmic_hal()
+
+
+def _find_7z():
+    """Locate 7z binary across hosts. The cosmic HAL is preferred when
+    it exposes `seven_zip_path()`; otherwise we look in the usual
+    install locations per platform."""
+    # 1. Cosmic HAL helper
+    if _HAL and hasattr(_HAL, "seven_zip_path"):
+        try:
+            p = _HAL.seven_zip_path()
+            if p and os.path.isfile(p): return p
+        except Exception: pass
+    # 2. PATH lookup — works on every host where 7z is installed
+    for name in ("7z", "7zz", "7za"):
+        p = shutil.which(name)
+        if p and os.path.isfile(p): return p
+    # 3. Known fallback locations (Windows + FreeBSD/Linux pkg defaults)
+    fallbacks = [
+        r"C:\Program Files\7-Zip\7z.exe",
+        r"C:\Program Files (x86)\7-Zip\7z.exe",
+        "/usr/local/bin/7z",          # FreeBSD pkg install p7zip
+        "/usr/local/bin/7zz",
+        "/usr/bin/7z",                # Linux apt install p7zip-full
+    ]
+    for p in fallbacks:
+        if os.path.isfile(p): return p
+    return None
+
+
+_7Z = _find_7z()
+
+
+# Windows-only subprocess flag — guard so this file runs on FreeBSD too.
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+# ── Image listing / extraction (Cosmic-preferred, direct fallback) ─────
+def _list_image(path):
+    """Return list of (entry_path, size, is_dir) for the given image."""
+    # Prefer the HAL when available
+    if _HAL and hasattr(_HAL, "disk_image_list"):
+        try: return _HAL.disk_image_list(path) or []
+        except Exception: pass
+    if not _7Z:
+        return [("(7-Zip not found — install via your package manager)",
+                  "0", False)]
+    try:
+        r = subprocess.run(
+            [_7Z, "l", "-ba", "-slt", path],
+            capture_output=True, text=True, timeout=30,
+            creationflags=_CREATE_NO_WINDOW)
+        entries, cur = [], {}
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if   line.startswith("Path = "):       cur["path"] = line[7:]
+            elif line.startswith("Size = "):       cur["size"] = line[7:]
+            elif line.startswith("Attributes = "): cur["attr"] = line[13:]
+            elif line == "" and cur:
+                if "path" in cur:
+                    is_dir = cur.get("attr", "").startswith("D")
+                    entries.append((cur["path"], cur.get("size", "0"), is_dir))
+                cur = {}
+        if cur.get("path"):
+            entries.append((cur["path"], cur.get("size", "0"),
+                            cur.get("attr", "").startswith("D")))
+        return entries
+    except Exception as ex:
+        return [(f"Error: {ex}", "0", False)]
+
+
+def _extract_one(image, item, out_dir):
+    if _HAL and hasattr(_HAL, "disk_image_extract"):
+        try:
+            _HAL.disk_image_extract(image, [item], out_dir)
+            return
+        except Exception: pass
+    if _7Z:
+        subprocess.run(
+            [_7Z, "e", image, f"-o{out_dir}", item, "-y"],
+            capture_output=True,
+            creationflags=_CREATE_NO_WINDOW)
+
+
+def _extract_all(image, out_dir):
+    if _HAL and hasattr(_HAL, "disk_image_extract"):
+        try:
+            _HAL.disk_image_extract(image, None, out_dir)
+            return
+        except Exception: pass
+    if _7Z:
+        subprocess.run(
+            [_7Z, "x", image, f"-o{out_dir}", "-y"],
+            capture_output=True,
+            creationflags=_CREATE_NO_WINDOW)
+
+
+# ── Helpers ────────────────────────────────────────────────────────────
+def _fmt_size(s):
+    try:
+        n = int(s)
+        if n >= 1_000_000: return f"{n/1_000_000:.1f} MB"
+        if n >= 1_000:     return f"{n/1_000:.1f} KB"
+        return f"{n} B"
+    except Exception:
+        return str(s)
+
+
+def _icon_for(name, is_dir):
+    """Generic per-extension icons. No vendor-specific marks: an .app
+    folder is shown as a regular folder of resources, NOT with the
+    Apple logo — Luci has nothing to do with running platform apps."""
+    if is_dir: return "📁"
+    ext = os.path.splitext(name)[1].lower()
+    return {
+        ".app":  "📁",      # bundle = folder of resources, nothing more
+        ".pkg":  "📦",
+        ".iso":  "🗄",
+        ".dmg":  "🗄",
+        ".img":  "🗄",
+        ".py":   "🐍",
+        ".txt":  "📄",
+        ".pdf":  "📕",
+        ".png":  "🖼",
+        ".jpg":  "🖼",
+        ".jpeg": "🖼",
+        ".gif":  "🖼",
+        ".mp4":  "🎬",
+        ".mp3":  "🎵",
+        ".wav":  "🎵",
+        ".zip":  "🗜",
+        ".tar":  "🗜",
+        ".gz":   "🗜",
+        ".xml":  "📋",
+        ".json": "{}",
+        ".sh":   "⚙",
+        ".bat":  "⚙",
+    }.get(ext, "📄")
+
+
+# ── Public entry points ────────────────────────────────────────────────
+def open_image(desktop, path):
+    """Open a specific image file directly (called from File Manager)."""
+    _build_window(desktop, path)
+
+
+# Legacy entry — older Luci/FileManager glue may still call open_dmg().
+def open_dmg(desktop, path):
+    open_image(desktop, path)
+
+
+def main(desktop):
+    _build_window(desktop, None)
+
+
+# ── UI build ───────────────────────────────────────────────────────────
+def _build_window(desktop, initial_path):
+    win = tk.Toplevel(desktop.root)
+    win.overrideredirect(True)
+    win.configure(bg=C["border"])
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    w, h   = 760, 520
+    offset = len(getattr(desktop, "_windows", [])) * 24
+    win.geometry(f"{w}x{h}+{max(0,(sw-w)//2+offset)}+{max(30,(sh-h)//2+offset)}")
+    win.attributes("-topmost", False)
+    win.lift()
+
+    image_path = [initial_path]
+    entries    = []
+
+    # ── Title bar (use global Luci chrome when available) ─────────────
+    if hasattr(desktop, "apply_chrome"):
+        desktop.apply_chrome(win, title="Disk Image Viewer",
+                              icon="🗄", include_body=False)
+        title_lbl = None
+    else:
+        bar = tk.Frame(win, bg=C["win_title"], height=32)
+        bar.pack(fill="x"); bar.pack_propagate(False)
+        title_lbl = tk.Label(bar, text="  🗄  Disk Image Viewer",
+                              bg=C["win_title"], fg=C["accent2"],
+                              font=FONT_BOLD)
+        title_lbl.pack(side="left", fill="y")
+        tk.Button(bar, text="✕", bg=C["win_title"], fg=C["dim"],
+                  activebackground=C["red"], activeforeground="white",
+                  font=FONT_BOLD, relief="flat", bd=0, padx=10,
+                  command=win.destroy).pack(side="right", fill="y")
+        tk.Button(bar, text="─", bg=C["win_title"], fg=C["dim"],
+                  activebackground=C["border"],
+                  font=FONT_BOLD, relief="flat", bd=0, padx=10,
+                  command=win.withdraw).pack(side="right", fill="y")
+        drag = [None]
+        bar.bind("<ButtonPress-1>",
+                 lambda e: drag.__setitem__(0,
+                     (e.x_root-win.winfo_x(), e.y_root-win.winfo_y())))
+        bar.bind("<B1-Motion>",
+                 lambda e: win.geometry(
+                     f"+{e.x_root-drag[0][0]}+{e.y_root-drag[0][1]}")
+                 if drag[0] else None)
+
+    # ── Toolbar ───────────────────────────────────────────────────────
+    toolbar = tk.Frame(win, bg=C["panel"], height=38)
+    toolbar.pack(fill="x", padx=1); toolbar.pack_propagate(False)
+
+    def _open_file():
+        f = filedialog.askopenfilename(
+            title="Open disk image",
+            filetypes=[
+                ("Disk image",
+                 "*.iso *.dmg *.img *.vhd *.vhdx"),
+                ("ISO image",   "*.iso"),
+                ("DMG image",   "*.dmg"),
+                ("Raw image",   "*.img"),
+                ("VHD",         "*.vhd *.vhdx"),
+                ("All files",   "*.*"),
+            ])
+        if f:
+            image_path[0] = f
+            _load()
+
+    tk.Button(toolbar, text="📂 Open", bg=C["accent"], fg="white",
+              font=FONT_SM, relief="flat", bd=0, padx=12,
+              activebackground=C["accent2"],
+              command=_open_file).pack(side="left", padx=6, pady=5)
+
+    def _extract_all_clicked():
+        if not image_path[0] or not entries: return
+        out = filedialog.askdirectory(title="Extract to folder")
+        if not out: return
+        status_var.set("  Extracting…")
+        win.update_idletasks()
+        def _work():
+            _extract_all(image_path[0], out)
+            win.after(0, lambda: status_var.set(f"  Extracted to: {out}"))
+        threading.Thread(target=_work, daemon=True).start()
+
+    tk.Button(toolbar, text="📤 Extract All", bg=C["panel"], fg=C["text"],
+              font=FONT_SM, relief="flat", bd=0, padx=12,
+              activebackground=C["border"],
+              command=_extract_all_clicked).pack(side="left", pady=5)
+
+    path_lbl = tk.Label(toolbar, text="  No image loaded", bg=C["panel"],
+                        fg=C["dim"], font=("Consolas", 9), anchor="w")
+    path_lbl.pack(side="left", fill="x", expand=True, padx=4)
+
+    # ── Body ──────────────────────────────────────────────────────────
+    body = tk.Frame(win, bg=C["win_bg"])
+    body.pack(fill="both", expand=True, padx=1)
+
+    # Tool-missing banner
+    if not _7Z and not (_HAL and hasattr(_HAL, "disk_image_list")):
+        warn = tk.Frame(body, bg="#1a0e00", pady=8)
+        warn.pack(fill="x")
+        tk.Label(warn,
+            text="⚠  7-Zip / p7zip not found — install via your "
+                 "package manager (FreeBSD: pkg install p7zip).",
+            bg="#1a0e00", fg=C["yellow"],
+            font=FONT_SM).pack(side="left", padx=12)
+
+    # Honesty banner — read-only inspector, never an app runner.
+    note = tk.Frame(body, bg="#050d1a", pady=4)
+    note.pack(fill="x")
+    tk.Label(note,
+        text="ℹ  Read-only inspector. Bundles inside images "
+             "(.app, .pkg, etc.) are shown as folders of resources — "
+             "Luci does not execute platform-specific binaries.",
+        bg="#050d1a", fg=C["dim"],
+        font=("Segoe UI", 8), wraplength=720, justify="left"
+        ).pack(side="left", padx=10)
+
+    # ── Tree ──────────────────────────────────────────────────────────
+    tree_frame = tk.Frame(body, bg=C["win_bg"])
+    tree_frame.pack(fill="both", expand=True, padx=4, pady=4)
+
+    style = ttk.Style()
+    style.theme_use("clam")
+    style.configure("DI.Treeview",
+                    background="#080f1f", foreground=C["text"],
+                    fieldbackground="#080f1f", rowheight=22,
+                    font=("Segoe UI", 9))
+    style.configure("DI.Treeview.Heading",
+                    background=C["panel"], foreground=C["dim"],
+                    font=("Segoe UI", 9, "bold"))
+    style.map("DI.Treeview", background=[("selected", C["accent"])])
+
+    tree = ttk.Treeview(tree_frame, style="DI.Treeview",
+                        columns=("size",),
+                        show="tree headings", selectmode="browse")
+    tree.heading("#0",   text="Name")
+    tree.heading("size", text="Size")
+    tree.column("#0",    width=480, stretch=True)
+    tree.column("size",  width=90,  stretch=False, anchor="e")
+
+    vsb = tk.Scrollbar(tree_frame, orient="vertical",
+                        command=tree.yview, bg=C["panel"])
+    hsb = tk.Scrollbar(tree_frame, orient="horizontal",
+                        command=tree.xview, bg=C["panel"])
+    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    vsb.pack(side="right",  fill="y")
+    hsb.pack(side="bottom", fill="x")
+    tree.pack(fill="both", expand=True)
+
+    # Right-click → extract a single item
+    def _rc_extract(event):
+        iid = tree.identify_row(event.y)
+        if not iid or not image_path[0]: return
+        tree.selection_set(iid)
+        parts, cur = [], iid
+        while cur:
+            txt = tree.item(cur, "text").strip()
+            parts.insert(0, txt)
+            cur = tree.parent(cur)
+        full_inner = "/".join(p.split("  ", 1)[-1] for p in parts)
+        m = tk.Menu(win, tearoff=0, bg=C["panel"], fg=C["text"],
+                    activebackground=C["accent"], font=FONT_SM,
+                    relief="flat")
+        m.add_command(label="📤  Extract this item",
+                      command=lambda p=full_inner: _extract_pick(p))
+        try: m.tk_popup(event.x_root, event.y_root)
+        finally: m.grab_release()
+
+    def _extract_pick(inner):
+        out = filedialog.askdirectory(title="Extract to folder")
+        if not out: return
+        status_var.set("  Extracting…")
+        win.update_idletasks()
+        def _w():
+            _extract_one(image_path[0], inner, out)
+            win.after(0, lambda: status_var.set(f"  Extracted to: {out}"))
+        threading.Thread(target=_w, daemon=True).start()
+
+    tree.bind("<Button-3>", _rc_extract)
+
+    # ── Status bar ────────────────────────────────────────────────────
+    status_var = tk.StringVar(value="  Ready")
+    tk.Label(win, textvariable=status_var, bg=C["panel"], fg=C["dim"],
+             font=("Segoe UI", 8), anchor="w"
+             ).pack(side="bottom", fill="x", padx=1, pady=(0, 1))
+
+    # ── Loader ────────────────────────────────────────────────────────
+    def _load():
+        path = image_path[0]
+        if not path or not os.path.isfile(path):
+            return
+        fname = os.path.basename(path)
+        if title_lbl is not None:
+            title_lbl.config(text=f"  🗄  Disk Image Viewer — {fname}")
+        path_lbl.config(text=f"  {path}")
+        status_var.set("  Loading contents…")
+        win.update_idletasks()
+
+        def _worker():
+            es = _list_image(path)
+            win.after(0, lambda: _populate_tree(es))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _populate_tree(es):
+        entries.clear(); entries.extend(es)
+        tree.delete(*tree.get_children())
+        nodes = {}
+        for (epath, size, is_dir) in es:
+            parts = epath.replace("\\", "/").split("/")
+            parent_iid = ""
+            for depth, part in enumerate(parts):
+                key = "/".join(parts[:depth+1])
+                if key not in nodes:
+                    is_leaf = (depth == len(parts) - 1)
+                    icon = _icon_for(part,
+                                      (is_dir and is_leaf) or (not is_leaf))
+                    disp_sz = _fmt_size(size) if is_leaf and not is_dir else ""
+                    iid = tree.insert(parent_iid, "end",
+                                       text=f"  {icon}  {part}",
+                                       values=(disp_sz,))
+                    nodes[key] = iid
+                parent_iid = nodes[key]
+        status_var.set(f"  {len(es)} items  ·  {os.path.basename(image_path[0])}")
+        lucy_log("DISKIMG", f"Loaded {image_path[0]} — {len(es)} items")
+
+    if initial_path:
+        win.after(100, _load)
+
+    lucy_log("DISKIMG", "Disk Image Viewer opened")

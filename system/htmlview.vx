@@ -1,0 +1,84 @@
+# VX:name=HTML Viewer
+# VX:icon=🌐
+# VX:version=1.0
+# VX:author=Vincent Ilagan
+# VX:net=none
+# VX:sig=KdB1qUpsP1XBg4ZJ/u1a1ETolD00G5ptwExvwrUpFSEstybz/XwrfFukp8dBi4DJ3ACWmpGME7wCxIlbBHGiCA==
+"""HTML Viewer — a clean, chromeless player for .html / .htm files.
+
+Double-clicking an HTML file in Files opens it here: just the rendered
+page, no tabs, no address bar, no browser clutter. The Luci Window
+Manager frames it like any other Luci app, so it feels native.
+
+Renders with the system Chromium in app-mode (file:// only). Falls
+back to a clear message if Chromium isn't installed.
+"""
+
+import os
+import subprocess
+
+CHROME_CANDIDATES = (
+    "/usr/local/bin/chrome",
+    "/usr/local/bin/chromium",
+    "/usr/local/bin/chromium-browser",
+)
+
+
+def _chrome():
+    for p in CHROME_CANDIDATES:
+        if os.path.isfile(p):
+            return p
+    try:
+        import shutil
+        return shutil.which("chrome") or shutil.which("chromium")
+    except Exception:
+        return None
+
+
+def _toast(desktop, msg):
+    for attr in ("_toast", "toast", "notify"):
+        fn = getattr(desktop, attr, None)
+        if callable(fn):
+            try:
+                fn(msg); return
+            except Exception:
+                pass
+
+
+def open_html(desktop, path):
+    """Open one .html/.htm file in a clean app-mode window."""
+    if not path or not os.path.isfile(path):
+        _toast(desktop, "HTML file not found")
+        return
+    chrome = _chrome()
+    if not chrome:
+        _toast(desktop, "Chromium not installed — pkg install chromium")
+        return
+    # Dedicated profile so the viewer never shares tabs/history with
+    # the full browser and always opens clean.
+    profile = os.path.expanduser("~/.config/luci/htmlview")
+    try:
+        os.makedirs(profile, exist_ok=True)
+    except Exception:
+        pass
+    url = "file://" + os.path.abspath(path)
+    try:
+        subprocess.Popen(
+            [chrome,
+             "--app=" + url,
+             "--user-data-dir=" + profile,
+             "--no-first-run", "--no-default-browser-check",
+             "--disable-gpu", "--disable-software-rasterizer",
+             "--password-store=basic",
+             "--window-size=1100,760"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True,
+            start_new_session=True)
+        _toast(desktop, "Opening " + os.path.basename(path) + "…")
+    except Exception as ex:
+        _toast(desktop, "HTML Viewer error: " + str(ex))
+
+
+def main(desktop=None):
+    """Launched with no file (from the dock) — show a friendly note."""
+    _toast(desktop, "HTML Viewer: double-click an .html file in Files")

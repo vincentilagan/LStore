@@ -1,0 +1,917 @@
+# VX:name=WiFi
+# VX:icon=📶
+# VX:version=1.0
+# VX:sig=BNuWCpyEV8n5MC5KfQ9HjlXEnna1V1eTA/n1ZjDOmZCCQXR48BwENHBHT/sB9xRayWfFyvQdAMWIDmWyUfF8BQ==
+"""
+Luci WiFi — frameless PyQt5 panel that drops down from the topbar 📶
+icon. Replaces the legacy wpa_gui (Qt4, broken on FreeBSD 15.x focus).
+
+What it does
+============
+  • Triggers an `ifconfig wlan0 scan`, then reads the cached scan with
+    `ifconfig wlan0 list scan` and shows the result as a clean list
+    (SSID • channel • RSSI bar • lock icon for protected networks).
+  • Click a row → prompt for the passphrase if encrypted, then run
+    `wpa_passphrase | service wpa_supplicant restart | dhclient` so the
+    user is connected without ever leaving the panel.
+  • Shows current connection status (associated SSID + IP) at the top.
+
+Why a .vx and not a pkg
+=======================
+We don't touch the build pipeline. Drop this file into programfiles/
+and Luci picks it up on next launch; the topbar 📶 click handler can be
+pointed at us via launch_vx().
+"""
+
+import os, sys, re, subprocess, shlex, time, threading
+from PyQt5.QtCore    import Qt, QTimer, pyqtSignal
+from PyQt5.QtGui     import QFont, QColor, QPainter, QPen, QBrush
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                              QListWidget, QListWidgetItem, QPushButton,
+                              QLineEdit, QDialog, QFrame, QApplication,
+                              QSizePolicy, QMessageBox, QCheckBox)
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+try:
+    from luci import C
+except Exception:
+    C = {"bg":"#0a0e17","panel":"#121827","accent":"#5ec8ff",
+         "accent2":"#7aa9ff","text":"#cfe4ff","dim":"#7d99c4",
+         "win_title":"#0e1e38","red":"#ff5b6b","green":"#4ade80"}
+
+WLAN_IF = "wlan0"
+_IS_WIN = sys.platform.startswith("win")
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Helpers — every shell call is routed through cosmic.hal.shell so the
+# Cosmic kernel sees it on the bus and the .vx never trips the Cosmic
+# Guard bypass warning. We resolve the cosmic handle lazily: if the
+# panel hasn't been attached to a desktop yet (e.g. running under
+# `python wifi.vx` standalone), we fall back to direct subprocess.
+# ────────────────────────────────────────────────────────────────────────
+_HAL = None
+
+def _bind_hal(desktop):
+    """Called once from main(desktop) so the helpers below can reach
+    cosmic.hal without threading it through every call."""
+    global _HAL
+    try:
+        if desktop is not None:
+            cos = getattr(desktop, "cosmic", None) \
+                  or getattr(desktop, "_cosmic", None)
+            if cos is not None:
+                _HAL = getattr(cos, "hal", None)
+    except Exception:
+        _HAL = None
+
+
+def _sh(cmd, timeout=10):
+    """Run a shell command, return (rc, stdout). Goes through
+    cosmic.hal.shell() when bound — that gives Cosmic an event on
+    the bus and avoids the guard warning. Falls back to direct
+    subprocess if no HAL is attached yet."""
+    if _HAL is not None and hasattr(_HAL, "shell"):
+        try:
+            return _HAL.shell(cmd, timeout=timeout)
+        except Exception:
+            pass
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True,
+                           text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "")
+    except Exception:
+        return 1, ""
+
+
+def _wpacli(args, timeout=8):
+    """Run a wpa_cli sub-command bound to WLAN_IF. wpa_supplicant runs
+    as root and exposes a control socket under /var/run/wpa_supplicant/
+    that's accessible to the wheel group (the default Luci user is in
+    wheel) — so wpa_cli works from the desktop session without us
+    having to elevate the whole Python process.
+    """
+    return _sh(f"wpa_cli -i {WLAN_IF} {args}", timeout=timeout)
+
+
+# ── Windows backend: `netsh wlan show ...` ─────────────────────────────
+def _scan_windows():
+    """Parse `netsh wlan show networks mode=bssid` into our row dict."""
+    rc, out = _sh("netsh wlan show networks mode=bssid", timeout=10)
+    rows = []
+    ssid = None
+    for ln in out.splitlines():
+        s = ln.strip()
+        m = re.match(r"SSID \d+ : (.*)", s)
+        if m:
+            ssid = m.group(1).strip() or "(hidden)"
+            continue
+        m = re.match(r"BSSID \d+\s*:\s*([0-9a-fA-F:]{17})", s)
+        if m and ssid:
+            bssid = m.group(1).lower()
+            rows.append({"ssid": ssid, "bssid": bssid,
+                          "ch": 0, "rssi": -70, "sec": "wpa2"})
+            continue
+        m = re.match(r"Signal\s*:\s*(\d+)%", s)
+        if m and rows:
+            # Convert percent (0-100) to a -dBm-ish value for the bars
+            # widget. 100% -> -40 dBm,  50% -> -75 dBm,  0% -> -100 dBm.
+            pct = int(m.group(1))
+            rows[-1]["rssi"] = -100 + int(pct * 0.6)
+            continue
+        m = re.match(r"Channel\s*:\s*(\d+)", s)
+        if m and rows: rows[-1]["ch"] = int(m.group(1))
+        m = re.match(r"Authentication\s*:\s*(.*)", s)
+        if m and rows:
+            a = m.group(1).strip().lower()
+            if "open" in a: rows[-1]["sec"] = "open"
+            elif "wep" in a: rows[-1]["sec"] = "wep"
+            elif "wpa2" in a: rows[-1]["sec"] = "wpa2"
+            elif "wpa3" in a: rows[-1]["sec"] = "wpa2"
+            elif "wpa" in a:  rows[-1]["sec"] = "wpa"
+    rows.sort(key=lambda r: r["rssi"], reverse=True)
+    return rows
+
+
+def _status_windows():
+    rc, out = _sh("netsh wlan show interfaces", timeout=5)
+    ssid = ip = None
+    for ln in out.splitlines():
+        s = ln.strip()
+        m = re.match(r"SSID\s*:\s*(.+)", s)
+        if m and "BSSID" not in s: ssid = m.group(1).strip() or None
+    # IP lookup via ipconfig is heavier — skip; we only need the SSID
+    # on Windows for UI validation.
+    return (ssid, ip)
+
+
+def _connect_windows(ssid, psk):
+    """Windows connect: just attempt a saved-profile connect. Creating
+    a new profile XML is a full project on its own; for UI validation
+    we just trigger the saved profile if it exists."""
+    rc, _ = _sh(f'netsh wlan connect name="{ssid}"', timeout=6)
+    return (rc == 0, "Connecting…" if rc == 0 else "No saved profile.")
+
+
+def _ensure_wpa_running():
+    """Best-effort: make sure wpa_supplicant is actually running and
+    bound to WLAN_IF. wpa_cli silently returns empty results if the
+    daemon isn't up, which is what was leaving the panel showing
+    "0 network(s)" even though the radio was healthy. Returns a short
+    status string for the UI: "" on success, otherwise a human reason.
+    """
+    rc, out = _sh("pgrep -lf wpa_supplicant", timeout=3)
+    if rc == 0 and WLAN_IF in out:
+        return ""
+    # Daemon not up — try to bring it up. service wpa_supplicant start
+    # needs root; if we don't have it we surface a clear hint instead
+    # of failing silently.
+    _sh(f"ifconfig {WLAN_IF} up", timeout=3)
+    rc, _ = _sh(f"service wpa_supplicant start {WLAN_IF}", timeout=8)
+    if rc != 0:
+        return ("wpa_supplicant not running. From a root shell:\n"
+                f"  service wpa_supplicant start {WLAN_IF}")
+    return ""
+
+
+def _scan(trigger=True):
+    """Cross-platform WiFi scan dispatcher.
+      • Windows uses `netsh wlan show networks` (works on any laptop
+        without root; perfect for testing the panel locally).
+      • FreeBSD uses wpa_cli against the wpa_supplicant control socket.
+    Same row schema either way: {ssid, bssid, ch, rssi, sec}.
+    """
+    if _IS_WIN:
+        return _scan_windows()
+    _ensure_wpa_running()
+    if trigger:
+        _wpacli("scan", timeout=4)
+    rc, out = _wpacli("scan_results", timeout=4)
+    rows = []
+    for ln in out.splitlines():
+        # Header line starts with "bssid /" or contains "frequency".
+        if "bssid" in ln.lower() and "frequency" in ln.lower():
+            continue
+        parts = ln.split("\t")
+        # Expected columns: bssid  freq  signal  flags  ssid
+        if len(parts) < 5:
+            continue
+        bssid, freq, sig, flags, ssid = parts[0], parts[1], parts[2], parts[3], parts[4]
+        try:
+            freq = int(freq); sig = int(sig)
+        except ValueError:
+            continue
+        # Map frequency -> channel for display. 2.4GHz: 2412 + 5*(ch-1).
+        # 5GHz: 5000 + 5*ch. Close enough for label use.
+        if freq < 2500:
+            ch = (freq - 2407) // 5
+        else:
+            ch = (freq - 5000) // 5
+        upper = flags.upper()
+        if   "WPA2" in upper or "RSN" in upper: sec = "wpa2"
+        elif "WPA" in upper:                    sec = "wpa"
+        elif "WEP" in upper:                    sec = "wep"
+        else:                                   sec = "open"
+        rows.append({
+            "ssid":  ssid or "(hidden)",
+            "bssid": bssid.lower(),
+            "ch":    ch,
+            "rssi":  sig,
+            "sec":   sec,
+        })
+    rows.sort(key=lambda r: r["rssi"], reverse=True)
+    return rows
+
+
+def _status():
+    """Return (ssid_or_none, ip_or_none) for the current wlan0 link.
+    Cross-platform; Windows path uses `netsh wlan show interfaces`."""
+    if _IS_WIN:
+        return _status_windows()
+    rc, out = _sh(f"ifconfig {WLAN_IF}", timeout=3)
+    if rc != 0: return (None, None)
+    ssid = None; ip = None
+    for ln in out.splitlines():
+        ln = ln.strip()
+        m = re.match(r"ssid\s+(.+?)\s+channel", ln)
+        if m: ssid = m.group(1).strip().strip('"') or None
+        m = re.match(r"inet\s+(\d+\.\d+\.\d+\.\d+)", ln)
+        if m: ip = m.group(1)
+    if ssid in (None, "", "0"): ssid = None
+    return (ssid, ip)
+
+
+def _internet_ok(timeout=5):
+    """True only if the box can actually REACH the internet — not just
+    'has an IP'. This is the difference between 'connected with data' and
+    the 'connected but nothing loads' state Vincent hit: wlan0 can be
+    associated + have an address while the default route still points at
+    a now-dead ethernet port. A single ICMP to 1.1.1.1 settles it."""
+    if _IS_WIN:
+        rc, _ = _sh("ping -n 1 -w 3000 1.1.1.1", timeout=timeout)
+        return rc == 0
+    rc, _ = _sh("ping -c 1 -t 3 1.1.1.1", timeout=timeout)
+    return rc == 0
+
+
+def _wlan_ip():
+    _, out = _sh(f"ifconfig {WLAN_IF}", timeout=3)
+    m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", out or "")
+    return m.group(1) if m else None
+
+
+def _fix_wifi_route():
+    """Force wlan0 to (re)own the default route by releasing + renewing
+    its DHCP lease. dhclient installs a default route via the interface
+    it configures, so this is what makes Wi-Fi actually carry data when
+    the ethernet port is unplugged (its stale default route is what left
+    Wi-Fi 'connected but dead'). Needs root — luci has a NOPASSWD sudoers
+    entry for /sbin/dhclient. Briefly drops the link (~2 s), exactly like
+    every OS does when you (re)join a network."""
+    if _IS_WIN:
+        return
+    _sh(f"sudo -n dhclient -r {WLAN_IF}", timeout=8)
+    _sh(f"sudo -n dhclient {WLAN_IF}", timeout=20)
+
+
+def _link_state():
+    """One word for the topbar icon + status pill:
+        'online' — associated, has IP, internet reachable
+        'nodata' — associated + IP but no internet (route/DNS problem)
+        'off'    — not associated / no IP."""
+    ssid, ip = _status()
+    if not (ssid and ip):
+        return "off"
+    return "online" if _internet_ok(timeout=4) else "nodata"
+
+
+def _find_saved_network(ssid):
+    """wpa network id already saved for this SSID, or None. Reusing the
+    existing block instead of add_network every time is what stops the
+    panel piling up dozens of duplicate '<ssid>' entries — a fumbled
+    password used to leave a graveyard of disabled copies that locked out
+    the good one."""
+    _, out = _wpacli("list_networks", timeout=4)
+    for line in (out or "").splitlines()[1:]:
+        cols = line.split("\t")
+        if len(cols) >= 2 and cols[1] == ssid:
+            return cols[0]
+    return None
+
+
+def _prep_network(ssid, psk):
+    """Reuse-or-create the wpa block for this SSID and set its passphrase.
+    Returns the network id (str) or None. Reusing (not add_network every
+    time) is what prevents the duplicate pile-up that used to bury the
+    working network under a graveyard of copies."""
+    nid = _find_saved_network(ssid)
+    if nid is None:
+        _, out = _wpacli("add_network", timeout=4)
+        nid = out.strip().splitlines()[-1].strip()
+        if not nid.isdigit():
+            return None
+    # Quoted strings inside wpa_cli need literal double-quotes; the outer
+    # single-quotes belong to the shell.
+    _wpacli(f'set_network {nid} ssid \'"{ssid}"\'')
+    if psk:
+        _wpacli(f'set_network {nid} psk \'"{psk}"\'')
+    else:
+        _wpacli(f"set_network {nid} key_mgmt NONE")
+    return nid
+
+
+def _wpa_status():
+    """Parse `wpa_cli status` into a dict (wpa_state, ssid, ip_address…)."""
+    _, out = _wpacli("status", timeout=4)
+    d = {}
+    for ln in (out or "").splitlines():
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            d[k.strip()] = v.strip()
+    return d
+
+
+def _radio(on):
+    """The panel's Wi-Fi ON/OFF switch. OFF disconnects + brings the
+    interface down (stops all association attempts); ON brings it back up
+    and lets wpa_supplicant reconnect to a saved network. Needs the
+    luci-net sudoers entry for /sbin/ifconfig."""
+    if _IS_WIN:
+        st = "enabled" if on else "disabled"
+        _sh(f'netsh interface set interface name="Wi-Fi" admin={st}', timeout=6)
+        return
+    if on:
+        _sh(f"sudo -n ifconfig {WLAN_IF} up", timeout=5)
+        _wpacli("reconnect")
+        _wpacli("reassociate")
+    else:
+        _wpacli("disconnect")
+        _sh(f"sudo -n ifconfig {WLAN_IF} down", timeout=5)
+
+
+def _radio_is_on():
+    if _IS_WIN:
+        return True
+    _, out = _sh(f"ifconfig {WLAN_IF}", timeout=3)
+    return "<UP" in (out or "") or ",UP," in (out or "")
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Signal arcs — three nested arcs (Luci-style look), lit by RSSI strength.
+# ────────────────────────────────────────────────────────────────────────
+class _Bars(QWidget):
+    def __init__(self, rssi):
+        super().__init__()
+        self._rssi = rssi
+        self.setFixedSize(22, 22)
+
+    def paintEvent(self, _):
+        from PyQt5.QtCore import QRectF
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if   self._rssi > -55: lit = 3
+        elif self._rssi > -65: lit = 2
+        elif self._rssi > -75: lit = 1
+        else:                   lit = 0
+        cx, cy = 11, 17
+        on  = QColor("#ffffff")
+        off = QColor(255, 255, 255, 55)
+        for i, r in enumerate((5, 9, 13)):
+            col = on if i < lit else off
+            pen = QPen(col); pen.setWidth(2); pen.setCapStyle(Qt.RoundCap)
+            p.setPen(pen)
+            p.drawArc(QRectF(cx - r, cy - r, r * 2, r * 2), 45 * 16, 90 * 16)
+        # centre dot
+        p.setBrush(QBrush(on if lit > 0 else off))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(cx - 2, cy - 2, 4, 4)
+        p.end()
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Password prompt — frameless modal with the Luci chrome look.
+# ────────────────────────────────────────────────────────────────────────
+class _AskPSK(QDialog):
+    """Centred password sheet: SOLID (opaque) rounded card so the field
+    and what you type are always clearly readable — the old translucent
+    glass let the network list show through and you couldn't read the
+    password. Has a show/hide eye toggle and a 'Remember this network'
+    checkbox. Returns .psk and .remember."""
+    def __init__(self, ssid, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        # NOTE: no WA_TranslucentBackground — an opaque card can never be
+        # 'seen through', which is exactly the readability bug Vincent hit.
+        self.setModal(True)
+        self.setFixedSize(400, 250)
+        self.psk = None
+        self.remember = True
+        self._ssid = ssid
+
+        lay = QVBoxLayout(self); lay.setContentsMargins(24, 22, 24, 18)
+        lay.setSpacing(10)
+        title = QLabel(f"Enter the password for “{ssid}”")
+        title.setFont(QFont("Segoe UI", 11, QFont.DemiBold))
+        title.setStyleSheet("color:#ffffff; background:transparent;")
+        title.setWordWrap(True)
+        lay.addWidget(title)
+        sub = QLabel("This network is password-protected.")
+        sub.setFont(QFont("Segoe UI", 9))
+        sub.setStyleSheet("color: rgba(255,255,255,150); background:transparent;")
+        lay.addWidget(sub)
+
+        # ── Password field with an inline show/hide eye button ──────────
+        fieldrow = QHBoxLayout(); fieldrow.setSpacing(8)
+        self._inp = QLineEdit()
+        self._inp.setEchoMode(QLineEdit.Password)
+        self._inp.setPlaceholderText("Password")
+        self._inp.setStyleSheet(
+            "QLineEdit {background:#0e1626; color:#ffffff;"
+            " border:1px solid rgba(255,255,255,55); border-radius:8px;"
+            " padding:9px 11px; selection-background-color:#5ec8ff;}"
+            "QLineEdit:focus {border:1px solid #5ec8ff;}")
+        self._inp.returnPressed.connect(self._ok)
+        fieldrow.addWidget(self._inp, 1)
+        self._eye = QPushButton("👁")
+        self._eye.setCheckable(True)
+        self._eye.setFixedSize(38, 38)
+        self._eye.setCursor(Qt.PointingHandCursor)
+        self._eye.setToolTip("Show / hide password")
+        self._eye.setStyleSheet(
+            "QPushButton {background:#0e1626; color:#cfe4ff;"
+            " border:1px solid rgba(255,255,255,55); border-radius:8px;"
+            " font-size:15px;}"
+            "QPushButton:hover {background:#16223a;}"
+            "QPushButton:checked {background:#1f3a5a; color:#ffffff;}")
+        self._eye.toggled.connect(self._toggle_echo)
+        fieldrow.addWidget(self._eye)
+        lay.addLayout(fieldrow)
+
+        # ── Remember this network ──────────────────────────────────────
+        self._remember = QCheckBox("Remember this network")
+        self._remember.setChecked(True)
+        self._remember.setCursor(Qt.PointingHandCursor)
+        self._remember.setStyleSheet(
+            "QCheckBox{color:rgba(255,255,255,200); background:transparent;"
+            " spacing:8px; font-size:12px;}"
+            "QCheckBox::indicator{width:18px;height:18px;border-radius:4px;"
+            " border:1px solid rgba(255,255,255,70); background:#0e1626;}"
+            "QCheckBox::indicator:checked{background:#5ec8ff;"
+            " border:1px solid #5ec8ff;}")
+        lay.addWidget(self._remember)
+
+        lay.addStretch(1)
+        row = QHBoxLayout(); row.addStretch(1); row.setSpacing(8)
+        cancel = QPushButton("Cancel")
+        cancel.setCursor(Qt.PointingHandCursor)
+        cancel.setStyleSheet(
+            "QPushButton {background: rgba(255,255,255,18); color:#ffffff;"
+            " border:none; border-radius:8px; padding:8px 18px;}"
+            "QPushButton:hover {background: rgba(255,255,255,32);}")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(cancel)
+        ok = QPushButton("Join")
+        ok.setCursor(Qt.PointingHandCursor)
+        ok.setStyleSheet(
+            "QPushButton {background:#5ec8ff; color:#0a1220; border:none;"
+            " border-radius:8px; padding:8px 22px; font-weight:600;}"
+            "QPushButton:hover {background:#7ad6ff;}")
+        ok.setDefault(True)
+        ok.clicked.connect(self._ok)
+        row.addWidget(ok)
+        lay.addLayout(row)
+        self._inp.setFocus()
+
+    def _toggle_echo(self, on):
+        self._inp.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)
+
+    def paintEvent(self, _):
+        from PyQt5.QtCore import QRectF
+        from PyQt5.QtGui  import QLinearGradient, QBrush, QPainterPath
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect())
+        clip = QPainterPath()
+        clip.addRoundedRect(r, 14, 14)
+        # SOLID body — fully opaque so nothing shows through and the
+        # password field reads crisply.
+        try:    pb = QColor(C.get("panel", "#121827"))
+        except Exception: pb = QColor(18, 24, 39)
+        pb.setAlpha(255)
+        p.fillPath(clip, pb)
+        sheen = QLinearGradient(0, 0, 0, 60)
+        sheen.setColorAt(0, QColor(255, 255, 255, 28))
+        sheen.setColorAt(1, QColor(255, 255, 255, 0))
+        p.fillPath(clip, QBrush(sheen))
+        pen = QPen(QColor(255, 255, 255, 90)); pen.setWidth(1)
+        p.setPen(pen); p.drawPath(clip)
+        p.end()
+
+    def _ok(self):
+        self.psk = self._inp.text()
+        self.remember = self._remember.isChecked()
+        self.accept()
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Main WiFi panel.
+# ────────────────────────────────────────────────────────────────────────
+class WiFiPanel(QWidget):
+    """Luci WiFi popover: rounded frosted glass with three colour dots
+    on the left, a large status pill, and generously spaced rows. The
+    frame is translucent so picom's blur shows through when available
+    — same chrome language as Volume / Lock."""
+    _net_status = pyqtSignal(str)   # info-line text from background net checks
+
+    def __init__(self, desktop=None):
+        super().__init__()
+        self._desk = desktop
+        self._net_status.connect(self._on_net_status)
+        # Match the exact glass recipe Luci's FileManager / apply_chrome
+        # uses — translucent body painted in paintEvent, top sheen,
+        # 1 px white border. With picom running you get backdrop blur
+        # for free; without picom it still reads as a dark glass card
+        # because the body paint isn't fully transparent.
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedWidth(380)
+        self.setMinimumHeight(480)
+        self._radius = 14
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 14, 18, 16)
+        root.setSpacing(12)
+
+        # ── Title bar: single × close on the right. This is a popup
+        # panel (toggled from the menubar 📶), NOT a window — so the
+        # macOS-style min/max traffic lights would be misleading.
+        head = QHBoxLayout(); head.setSpacing(6); head.setContentsMargins(0,0,0,0)
+        t = QLabel("Wi-Fi")
+        t.setFont(QFont("Segoe UI", 12, QFont.DemiBold))
+        t.setStyleSheet("color:#ffffff;background:transparent;")
+        head.addWidget(t)
+        head.addStretch(1)
+        # Wi-Fi ON/OFF switch (like Windows). Off drops the radio; On
+        # brings it back and reconnects — also a clean recovery when a
+        # simple Scan/refresh isn't enough.
+        self._radio_btn = QPushButton("On")
+        self._radio_btn.setCheckable(True)
+        self._radio_btn.setChecked(True)
+        self._radio_btn.setFixedSize(58, 24)
+        self._radio_btn.setCursor(Qt.PointingHandCursor)
+        self._radio_btn.setStyleSheet(
+            "QPushButton{border:none;border-radius:12px;font-weight:600;"
+            " font-size:11px;background:rgba(255,255,255,30);color:#cfe4ff;}"
+            "QPushButton:checked{background:#4c8dff;color:#ffffff;}")
+        self._radio_btn.toggled.connect(self._toggle_radio)
+        head.addWidget(self._radio_btn)
+        x = QPushButton("×")
+        x.setFixedSize(20, 20)
+        x.setStyleSheet(
+            "QPushButton{background:transparent;color:rgba(255,255,255,160);"
+            "border:none;font-size:16px;font-weight:bold;}"
+            "QPushButton:hover{color:#ffffff;background:rgba(255,255,255,30);"
+            "border-radius:10px;}")
+        x.clicked.connect(self.close)
+        head.addWidget(x)
+        root.addLayout(head)
+
+        # ── Status pill: large, prominent ────────────────────────────
+        self._stat = QLabel("Looking for networks…")
+        self._stat.setFont(QFont("Segoe UI", 10))
+        self._stat.setAlignment(Qt.AlignCenter)
+        self._stat.setStyleSheet(
+            "background:rgba(255,255,255,18);color:#ffffff;"
+            "border:none;border-radius:10px;padding:10px 14px;")
+        root.addWidget(self._stat)
+
+        # ── Networks list — flat, transparent rows ────────────────────
+        self._list = QListWidget()
+        self._list.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._list.viewport().setAttribute(Qt.WA_TranslucentBackground, True)
+        self._list.setFrameShape(QFrame.NoFrame)
+        self._list.setSpacing(0)
+        self._list.setStyleSheet("""
+            QListWidget          {background: transparent; border: none;
+                                  color:#ffffff; outline: none;}
+            QListWidget::item    {background: transparent; padding: 0;
+                                  border: none;}
+            QListWidget::item:hover    {background: rgba(255,255,255,18);
+                                        border-radius: 8px;}
+            QListWidget::item:selected {background: rgba(94,200,255,55);
+                                        border-radius: 8px;}
+            QScrollBar:vertical  {background: transparent; width: 6px;}
+            QScrollBar::handle:vertical {background: rgba(255,255,255,55);
+                                         border-radius: 3px; min-height: 24px;}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0; background: none;}
+        """)
+        self._list.itemClicked.connect(self._on_pick)
+        root.addWidget(self._list, 1)
+
+        # ── Footer: subtle Scan + count ──────────────────────────────
+        foot = QHBoxLayout(); foot.setContentsMargins(0,0,0,0)
+        self._scan_btn = QPushButton("Scan")
+        self._scan_btn.setCursor(Qt.PointingHandCursor)
+        self._scan_btn.setStyleSheet("""
+            QPushButton {background: rgba(94,200,255,180); color:#0a1220;
+                         border:none; border-radius:8px;
+                         padding:7px 22px; font-weight:600;}
+            QPushButton:hover  {background: rgba(94,200,255,220);}
+            QPushButton:pressed{background: rgba(94,200,255,255);}
+            QPushButton:disabled {background: rgba(255,255,255,30);
+                                  color: rgba(255,255,255,80);}
+        """)
+        self._scan_btn.clicked.connect(self._scan_now)
+        foot.addWidget(self._scan_btn)
+        # Advanced toggle — hides/shows the technical channel + dBm detail.
+        self._advanced = False
+        self._adv_btn = QPushButton("Advanced")
+        self._adv_btn.setCheckable(True)
+        self._adv_btn.setCursor(Qt.PointingHandCursor)
+        self._adv_btn.setStyleSheet("""
+            QPushButton {background: rgba(255,255,255,14); color:#cfe4ff;
+                         border:none; border-radius:8px;
+                         padding:7px 14px; font-weight:500;}
+            QPushButton:hover  {background: rgba(255,255,255,26);}
+            QPushButton:checked{background: rgba(94,200,255,60); color:#eaf6ff;}
+        """)
+        self._adv_btn.toggled.connect(self._toggle_advanced)
+        foot.addWidget(self._adv_btn)
+        foot.addStretch(1)
+        self._info = QLabel("")
+        self._info.setStyleSheet("color: rgba(255,255,255,140); background:transparent;")
+        foot.addWidget(self._info)
+        root.addLayout(foot)
+        self._last_rows = []
+
+        # Auto-position under the topbar's 📶 icon (top-right).
+        try:
+            sg = QApplication.primaryScreen().geometry()
+            self.move(sg.width() - self.width() - 16, 32)
+        except Exception:
+            self.move(640, 40)
+
+        QTimer.singleShot(60, self._refresh_status)
+        QTimer.singleShot(120, self._scan_now)
+
+        # Close on ESC.
+        from PyQt5.QtWidgets import QShortcut
+        from PyQt5.QtGui     import QKeySequence
+        QShortcut(QKeySequence("Escape"), self,
+                  activated=lambda: self.close())
+
+    # ── glass background — identical recipe to FileManager's chrome:
+    #     translucent body so picom can blur the desktop, top sheen
+    #     for the Luci "specular line" look, soft white edge ─────────
+    def paintEvent(self, _):
+        from PyQt5.QtCore import QRectF
+        from PyQt5.QtGui  import QLinearGradient, QBrush, QPainterPath
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect())
+        clip = QPainterPath()
+        clip.addRoundedRect(r, self._radius, self._radius)
+        # Translucent body — low alpha so the compositor blurs the
+        # real desktop behind it. Without a compositor it still reads
+        # as a dark glass card, just without the blur.
+        try:    pb = QColor(C.get("panel", "#121827"))
+        except Exception: pb = QColor(20, 28, 60)
+        pb.setAlpha(110)
+        p.fillPath(clip, pb)
+        # Top sheen — Luci specular highlight.
+        sheen = QLinearGradient(0, 0, 0, min(90, self.height() // 3))
+        sheen.setColorAt(0, QColor(255, 255, 255, 50))
+        sheen.setColorAt(1, QColor(255, 255, 255, 0))
+        p.fillPath(clip, QBrush(sheen))
+        # Soft white border (1 px) — defines the glass edge.
+        pen = QPen(QColor(255, 255, 255, 80)); pen.setWidth(1)
+        p.setPen(pen); p.drawPath(clip)
+        p.end()
+
+    # ── status pill ───────────────────────────────────────────────────
+    def _refresh_status(self):
+        ssid, ip = _status()
+        if ssid and ip:
+            self._stat.setText(f"{ssid}\n{ip}")
+            self._stat.setStyleSheet(
+                "background:rgba(40,201,63,40);color:#bdf5c6;"
+                "border:none;border-radius:10px;padding:10px 14px;"
+                "font-weight:600;")
+        elif ssid:
+            self._stat.setText(f"{ssid}\nGetting address…")
+            self._stat.setStyleSheet(
+                "background:rgba(94,200,255,40);color:#cfe4ff;"
+                "border:none;border-radius:10px;padding:10px 14px;"
+                "font-weight:600;")
+        else:
+            self._stat.setText("Not connected")
+            self._stat.setStyleSheet(
+                "background:rgba(255,255,255,18);color:#ffffff;"
+                "border:none;border-radius:10px;padding:10px 14px;")
+
+    # ── scan ──────────────────────────────────────────────────────────
+    def _scan_now(self):
+        # Two-phase scan so the UI never freezes:
+        #   1. paint whatever wpa_supplicant already has cached (instant)
+        #   2. kick a fresh scan, wait the radio's ~2 s settle in a
+        #      QTimer (Qt event loop keeps spinning, so clicks still
+        #      work), then repaint
+        self._scan_btn.setEnabled(False)
+        self._info.setText("Scanning…")
+        # Paint cached results so the panel doesn't sit empty.
+        self._paint_rows(_scan(trigger=False))
+        # Now trigger the radio sweep async.
+        self._wpacli_trigger()
+        QTimer.singleShot(2200, self._scan_finish)
+
+    def _wpacli_trigger(self):
+        _wpacli("scan", timeout=3)
+
+    def _scan_finish(self):
+        self._paint_rows(_scan(trigger=False))
+        self._scan_btn.setEnabled(True)
+        self._refresh_status()
+
+    def _paint_rows(self, rows):
+        self._last_rows = rows           # cache so Advanced can re-render
+        self._list.clear()
+        seen = set()
+        for n in rows:
+            if n["ssid"] in seen: continue
+            seen.add(n["ssid"])
+            self._add_row(n)
+        self._info.setText(f"{len(seen)} network(s)")
+
+    def _toggle_advanced(self, on):
+        """Show/hide the technical channel + dBm detail on each row."""
+        self._advanced = on
+        if self._last_rows:
+            self._paint_rows(self._last_rows)
+
+    def _on_net_status(self, text):
+        """Background net-check result → info line + status pill refresh."""
+        self._info.setText(text)
+        self._refresh_status()
+
+    def _add_row(self, n):
+        w = QWidget()
+        w.setAttribute(Qt.WA_TranslucentBackground, True)
+        h = QHBoxLayout(w); h.setContentsMargins(12, 9, 12, 9); h.setSpacing(12)
+        h.addWidget(_Bars(n["rssi"]))
+        # SSID — large; subtitle line below shows channel + signal in
+        # a softer colour: SSID bold, sub-line with band + signal info.
+        col = QVBoxLayout(); col.setSpacing(1); col.setContentsMargins(0,0,0,0)
+        ssid = QLabel(n["ssid"])
+        ssid.setFont(QFont("Segoe UI", 10, QFont.DemiBold))
+        ssid.setStyleSheet("color:#ffffff; background:transparent;")
+        col.addWidget(ssid)
+        # Friendly by default — a normal user shouldn't have to read
+        # "ch 11 · -37 dBm". Show band + Secured/Open; the technical
+        # channel + signal only appear when Advanced is toggled on.
+        band = "5 GHz" if n["ch"] >= 36 else "2.4 GHz"
+        if getattr(self, "_advanced", False):
+            subtxt = f"{band}  ·  ch {n['ch']}  ·  {n['rssi']} dBm"
+        else:
+            subtxt = f"{band}  ·  {'Secured' if n['sec'] != 'open' else 'Open'}"
+        sub  = QLabel(subtxt)
+        sub.setFont(QFont("Segoe UI", 8))
+        sub.setStyleSheet("color: rgba(255,255,255,140); background:transparent;")
+        col.addWidget(sub)
+        h.addLayout(col, 1)
+        if n["sec"] != "open":
+            lock = QLabel("🔒")
+            lock.setFont(QFont("Segoe UI Emoji", 11))
+            lock.setStyleSheet("color: rgba(255,255,255,200); background:transparent;")
+            h.addWidget(lock)
+        it = QListWidgetItem(self._list)
+        it.setSizeHint(w.sizeHint())
+        it.setData(Qt.UserRole, n)
+        self._list.addItem(it)
+        self._list.setItemWidget(it, w)
+
+    # ── connect flow ──────────────────────────────────────────────────
+    def _on_pick(self, item):
+        n = item.data(Qt.UserRole)
+        psk = None
+        remember = True
+        # If this network is ALREADY SAVED (Remember worked), reconnect
+        # with the STORED passphrase — never ask again. This is the whole
+        # point of "Remember this network": you type the password once,
+        # not on every restart. Only prompt for a secured network we've
+        # genuinely never joined before.
+        saved = (not _IS_WIN) and (_find_saved_network(n["ssid"]) is not None)
+        if n["sec"] != "open" and not saved:
+            dlg = _AskPSK(n["ssid"], self)
+            if dlg.exec_() != QDialog.Accepted: return
+            psk = dlg.psk
+            remember = dlg.remember
+            if not psk: return
+        self._info.setText(f"Connecting to {n['ssid']}…")
+        self._connect_async(n["ssid"], psk, remember)
+
+    def _connect_async(self, ssid, psk, remember):
+        """Connect on a worker thread (wpa_cli + dhclient block). Key
+        safety: it tries ONLY the picked network via select_network, and
+        if that network fails to associate (wrong password / unreachable)
+        it abandons the attempt and re-enables every saved network so the
+        PREVIOUSLY-WORKING one comes back. A mistyped password on network
+        B must never make network A ('IT Room') disappear."""
+        def work():
+            if _IS_WIN:
+                ok, msg = _connect_windows(ssid, psk)
+                self._net_status.emit(msg if ok else f"⚠ {msg}")
+                return
+            nid = _prep_network(ssid, psk)
+            if nid is None:
+                self._net_status.emit("⚠ Could not add network"); return
+            # Try ONLY this one — isolates the attempt from the working link.
+            _wpacli(f"select_network {nid}")
+            joined = False
+            for _ in range(30):                       # ~15 s
+                st = _wpa_status()
+                if st.get("wpa_state") == "COMPLETED" and st.get("ssid") == ssid:
+                    joined = True; break
+                time.sleep(0.5)
+            if not joined:
+                # Wrong password / unreachable → abandon and RESTORE every
+                # saved network so the previous one reconnects. IT Room
+                # must not vanish because another SSID was mistyped.
+                _wpacli(f"disable_network {nid}")
+                _wpacli("enable_network all")
+                _wpacli("reassociate")
+                self._net_status.emit(
+                    f"⚠ Couldn't join “{ssid}” — wrong password? "
+                    f"Restoring your previous network…")
+                return
+            # Joined. Re-enable the rest for future auto-connect + persist.
+            _wpacli("enable_network all")
+            if remember:
+                _wpacli("save_config")
+            # Address + real-data check (+ route self-heal).
+            _sh(f"sudo -n dhclient {WLAN_IF}", timeout=20)
+            ip = None
+            for _ in range(20):
+                s, ip = _status()
+                if s and ip:
+                    break
+                time.sleep(0.5)
+            if not ip:
+                self._net_status.emit("Still trying…"); return
+            if _internet_ok(timeout=4):
+                self._net_status.emit(f"✅ Connected  ·  {ip}"); return
+            self._net_status.emit("Getting data…")
+            _fix_wifi_route()
+            for _ in range(10):
+                if _internet_ok(timeout=3):
+                    s, ip2 = _status()
+                    self._net_status.emit(f"✅ Connected  ·  {ip2 or ip}"); return
+                time.sleep(1)
+            self._net_status.emit("⚠ Connected, but no internet")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _toggle_radio(self, on):
+        """Wi-Fi ON/OFF switch handler."""
+        self._radio_btn.setText("On" if on else "Off")
+        if on:
+            self._info.setText("Turning Wi-Fi on…")
+            threading.Thread(target=lambda: _radio(True), daemon=True).start()
+            QTimer.singleShot(3200, self._scan_now)
+            QTimer.singleShot(3400, self._refresh_status)
+        else:
+            self._info.setText("Wi-Fi is off")
+            self._list.clear()
+            threading.Thread(target=lambda: _radio(False), daemon=True).start()
+
+
+# ────────────────────────────────────────────────────────────────────────
+# .vx entry point — Luci calls main(desktop) when launched.
+# ────────────────────────────────────────────────────────────────────────
+def main(desktop=None):
+    # Hand the panel access to cosmic.hal so every shell call goes
+    # through the kernel's audit bus instead of bypassing it.
+    _bind_hal(desktop)
+    panel = WiFiPanel(desktop)
+    panel.show()
+    panel.raise_()
+    panel.activateWindow()
+    # Register in the per-path Qt panel registry so the menubar
+    # toggle helper (_toggle_vx_panel) can find + close us on a
+    # second click of the 📶 icon.
+    if desktop is not None:
+        try:
+            if not hasattr(desktop, "_vx_qt_panels"):
+                desktop._vx_qt_panels = {}
+            desktop._vx_qt_panels.setdefault(__file__, []).append(panel)
+            # Keep the legacy ref list too — older code may still read it.
+            if not hasattr(desktop, "_panels"): desktop._panels = []
+            desktop._panels.append(panel)
+        except Exception:
+            pass
+    return panel
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    p = main(None)
+    sys.exit(app.exec_())
