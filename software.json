@@ -12,7 +12,7 @@
     {"id": "obs", "name": "OBS Studio", "pkg": "obs-studio", "bin": "obs", "icon": "🎥", "category": "Software", "author": "OBS Project", "summary": "Screen recording and live streaming."},
     {"id": "kdenlive", "name": "Kdenlive", "pkg": "kdenlive", "bin": "kdenlive", "icon": "🎬", "category": "Software", "author": "KDE", "summary": "Non-linear video editor."},
     {"id": "shotcut", "name": "Shotcut", "pkg": "shotcut", "bin": "shotcut", "icon": "🎞️", "category": "Software", "author": "Meltytech, LLC", "summary": "Cross-platform video editor."},
-    {"id": "godot", "name": "Godot", "pkg": "godot-tools", "bin": "godot-tools", "icon": "🎮", "category": "Software", "author": "Godot Engine contributors", "summary": "Open-source game engine + editor. (The 'godot' pkg is runtime-only; 'godot-tools' is the IDE.)"},
+    {"id": "godot", "name": "Godot", "pkg": "godot-tools", "bin": "godot-tools", "icon": "🎮", "iconurl": "https://godotengine.org/assets/press/icon_color.png", "category": "Software", "author": "Godot Engine contributors", "summary": "Open-source game engine + editor. (The 'godot' pkg is runtime-only; 'godot-tools' is the IDE.)"},
     {"id": "libreoffice", "name": "LibreOffice", "pkg": "libreoffice", "bin": "libreoffice", "icon": "📄", "category": "Software", "author": "The Document Foundation", "summary": "Full office suite — opens Word, Excel, PowerPoint."},
     {"id": "firefox", "name": "Firefox", "pkg": "firefox", "bin": "firefox", "icon": "🌐", "category": "Software", "author": "Mozilla", "summary": "Web browser."},
     {"id": "thunderbird", "name": "Thunderbird", "pkg": "thunderbird", "bin": "thunderbird", "icon": "✉️", "category": "Software", "author": "MZLA Technologies (Mozilla)", "summary": "Email client."},
